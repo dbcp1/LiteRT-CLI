@@ -64,37 +64,68 @@ _LM_BINARY = "litert_lm_advanced_main"
 _LM_METRICS_FILE = "metrics.pb"
 _LM_PROVENANCE_FILE = "provenance.txt"
 _LM_RESULT_FILES = (_LM_METRICS_FILE, _LM_PROVENANCE_FILE)
-# Init plus --num-iterations prefill and decode cycles; the device stops the
-# job after this long.
+# Two processes of the binary, each an Init plus prefill and decode cycles;
+# the device stops the job after this long.
 _LM_EXECUTION_TIMEOUT_SECS = 1800
 _LM_RUN_SCRIPT_NAME = "litert_lm_run.sh"
 # Runs on the device as the job's binary. Runs LiteRT-LM's benchmark binary
 # from the CLI's directory with that directory on LD_LIBRARY_PATH (the
-# accelerator libraries pushed beside the binary load from there), removes the
-# caches an earlier session left beside the bundle so Init is a cold start, and
-# writes provenance.txt. Every argument goes to the binary unchanged, and the
-# binary's exit code is the job's.
+# accelerator libraries pushed beside the binary load from there), writes
+# provenance.txt and runs the binary twice. The warm-up process gets the same
+# arguments plus _LM_WARMUP_ARGS (a later occurrence of a flag replaces the
+# earlier one): its Init is a cold start, since the cache files beside the
+# bundle are removed first, and it writes the caches there (the XNNPACK weight
+# cache on CPU, the ML Drift program and weight caches on GPU). The measured
+# process runs with the arguments unchanged; its exit code is the job's, and a
+# failed warm-up process ends the job with its own. Both exit codes and the
+# cache files each process left go to provenance.txt. The `touch` gives the
+# bundle a fresh mtime with a fractional second: LiteRT-LM names a cache after
+# the bundle's mtime in whole seconds and its size, and with the whole-second
+# mtime of a pushed bundle two processes computed neighbouring seconds for the
+# same file, so the second missed the cache (three of eight processes on a
+# Galaxy S26; with a fractional mtime every process computed the same name).
 _LM_RUN_SCRIPT = """#!/system/bin/sh
 ROOT="{root}"
+CACHES="./*.xnnpack_cache* ./*_mldrift_*cache*.bin ./*.mtp_drafter*"
 cd "$ROOT" || exit 1
 chmod 755 {binary} || exit 1
-rm -f ./*.xnnpack_cache* ./*_mldrift_*cache*.bin ./*.mtp_drafter*
+rm -f $CACHES
 MODEL=""
 for arg in "$@"; do
   case "$arg" in --model_path=*) MODEL="${{arg#*=}}" ;; esac
 done
+[ -f "$MODEL" ] && touch "$MODEL"
 {{
   echo "date: $(date)"
   echo "product: $(getprop ro.product.model) ($(getprop ro.product.device))"
   echo "build: $(getprop ro.build.fingerprint)"
   echo "args: $*"
+  echo "model mtime: $(stat -c %y "$MODEL" 2>/dev/null)"
   echo "sha256:"
   sha256sum {binary} "$MODEL" ./*.so 2>/dev/null
 }} > {provenance}
-LD_LIBRARY_PATH="$ROOT" exec ./{binary} "$@"
+LD_LIBRARY_PATH="$ROOT" ./{binary} "$@" {warmup_args}
+rc=$?
+{{
+  echo "warm-up process: exit $rc"
+  echo "caches after the warm-up process:"
+  ls -l $CACHES 2>/dev/null | grep . || echo "  (none)"
+}} >> {provenance}
+[ "$rc" -eq 0 ] || exit "$rc"
+LD_LIBRARY_PATH="$ROOT" ./{binary} "$@"
+rc=$?
+{{
+  echo "measured process: exit $rc"
+  echo "caches after the measured process:"
+  ls -l $CACHES 2>/dev/null | grep . || echo "  (none)"
+}} >> {provenance}
+exit "$rc"
 """
-# One BenchmarkInfo block per iteration in the logcat; the values the summary
-# reads from each block (the first prefill and decode turn).
+# The warm-up process runs one iteration and writes no metrics file.
+_LM_WARMUP_ARGS = "--num_iterations=1 --metric_proto_file_path="
+# One BenchmarkInfo block per iteration in the logcat, followed by the peak
+# memory lines of --report_peak_memory_footprint; the values the summary reads
+# from each block (the first prefill and decode turn).
 _LM_BLOCK_START = "BenchmarkInfo:"
 _LM_AGGREGATED_BLOCK = "Aggregated BenchmarkInfo"
 _LM_METRIC_PATTERNS = {
@@ -102,7 +133,12 @@ _LM_METRIC_PATTERNS = {
     "ttft_s": re.compile(r"Time to first token: ([\d.]+) s"),
     "prefill_tok_s": re.compile(r"Prefill Speed: ([\d.]+) tokens/sec"),
     "decode_tok_s": re.compile(r"Decode Speed: ([\d.]+) tokens/sec"),
+    "peak_mem_mb": re.compile(r"Peak system ram usage: ([\d.]+) ?MB"),
 }
+# The process id of a logcat line ("MM-DD HH:MM:SS.mmm PID TID L TAG : ...").
+_LOGCAT_PID = re.compile(
+    r"^\d\d-\d\d \d\d:\d\d:\d\d\.\d+\s+(\d+)\s+\d+\s+[A-Z]\s"
+)
 _POLL_INTERVAL_SECS = 15
 # Socket timeout of one Device Run API request.
 _HTTP_TIMEOUT_SECS = 60
@@ -173,6 +209,7 @@ def _lm_run_script() -> str:
       root=constants.LITERT_CLI_ANDROID_ROOT,
       binary=_LM_BINARY,
       provenance=_LM_PROVENANCE_FILE,
+      warmup_args=_LM_WARMUP_ARGS,
   )
 
 
@@ -329,7 +366,9 @@ def _build_lm_benchmark_args(
   """Builds the LiteRT-LM benchmark binary's arguments for a bundle.
 
   The token counts and the iteration count are always emitted, so their
-  defaults live only in the click options of cli.py.
+  defaults live only in the click options of cli.py. The peak memory report is
+  always on: the binary logs it after each iteration and writes it to the
+  metrics file.
   """
   root = constants.LITERT_CLI_ANDROID_ROOT
   return [
@@ -340,6 +379,7 @@ def _build_lm_benchmark_args(
       f"--benchmark_decode_tokens={decode_tokens}",
       f"--max_num_tokens={max_num_tokens}",
       f"--num_iterations={num_iterations}",
+      "--report_peak_memory_footprint=true",
       f"--metric_proto_file_path={root}/{_LM_METRICS_FILE}",
   ]
 
@@ -539,22 +579,30 @@ def _wait_for_operation(
     time.sleep(min(_POLL_INTERVAL_SECS, remaining))
 
 
-def _lm_iterations(lines: list[str]) -> list[dict[str, float]]:
-  """One dict per BenchmarkInfo block of a LiteRT-LM logcat.
+def _lm_processes(lines: list[str]) -> list[list[dict[str, float]]]:
+  """The BenchmarkInfo blocks of a LiteRT-LM logcat, one list per process.
 
-  The binary logs one block per iteration and, after them, an aggregated
-  block over every iteration, which is skipped. A block without a prefill
-  and a decode speed is dropped.
+  The binary logs one block per iteration, the peak memory lines after it,
+  and after every iteration an aggregated block, which is skipped. Blocks are
+  grouped by the process id of their logcat lines, in order: the run script's
+  warm-up process, then the measured one (lines without a logcat prefix count
+  as one process). A block without a prefill and a decode speed is dropped.
   """
-  iterations: list[dict[str, float]] = []
+  processes: list[list[dict[str, float]]] = []
+  pids: list[str | None] = []
   current: dict[str, float] | None = None
   for line in lines:
     if _LM_AGGREGATED_BLOCK in line:
       current = None
       continue
     if line.rstrip().endswith(_LM_BLOCK_START):
+      match = _LOGCAT_PID.match(line)
+      pid = match.group(1) if match else None
+      if not pids or pids[-1] != pid:
+        pids.append(pid)
+        processes.append([])
       current = {}
-      iterations.append(current)
+      processes[-1].append(current)
       continue
     if current is None:
       continue
@@ -562,15 +610,25 @@ def _lm_iterations(lines: list[str]) -> list[dict[str, float]]:
       match = pattern.search(line)
       if match and key not in current:
         current[key] = float(match.group(1))
-  return [i for i in iterations if "prefill_tok_s" in i and "decode_tok_s" in i]
+  measured = [
+      [i for i in blocks if "prefill_tok_s" in i and "decode_tok_s" in i]
+      for blocks in processes
+  ]
+  return [blocks for blocks in measured if blocks]
 
 
 def _lm_summary(lines: list[str], warmup_iterations: int) -> list[str]:
-  """The medians over the iterations after the warm-up ones, as text lines.
+  """The medians over the measured process's iterations after the warm-up ones.
 
-  Empty when the logcat holds no measured iteration beyond the warm-up.
+  The measured process is the last one in the logcat, the run script's
+  warm-up process the one before it: the summary names the measured process's
+  Init and, when the warm-up process logged one, its cold Init. Empty when the
+  logcat holds no measured iteration beyond the warm-up.
   """
-  iterations = _lm_iterations(lines)
+  processes = _lm_processes(lines)
+  if not processes:
+    return []
+  iterations = processes[-1]
   measured = iterations[warmup_iterations:]
   if not measured:
     return []
@@ -585,15 +643,27 @@ def _lm_summary(lines: list[str], warmup_iterations: int) -> list[str]:
       median("ttft_s"),
   )
   init = iterations[0].get("init_ms")
+  warmup_process = processes[-2] if len(processes) > 1 else None
+  cold_init = warmup_process[0].get("init_ms") if warmup_process else None
+  peaks = [i["peak_mem_mb"] for i in iterations if "peak_mem_mb" in i]
   summary = [
       (
-          f"LiteRT-LM benchmark: {len(iterations)} iteration(s),"
-          f" {warmup_iterations} warm-up; median of the other {len(measured)}:"
+          "LiteRT-LM benchmark: "
+          + ("second process, " if warmup_process else "")
+          + f"{len(iterations)} iteration(s), {warmup_iterations} warm-up;"
+          f" median of the other {len(measured)}:"
       ),
       f"  prefill {prefill:.1f} tokens/s, decode {decode:.1f} tokens/s"
-      + (f", time to first token {ttft:.2f} s" if ttft is not None else "")
-      + (f"; init {init:.0f} ms (once per run)" if init is not None else ""),
+      + (f", time to first token {ttft:.2f} s" if ttft is not None else ""),
   ]
+  if init is not None:
+    summary[1] += f"; init {init:.0f} ms"
+    if cold_init is not None:
+      summary[1] += f" (cold {cold_init:.0f} ms in the first process)"
+    elif not warmup_process:
+      summary[1] += " (once per run)"
+  if peaks:
+    summary[1] += f"; peak memory {max(peaks):.0f} MB (RSS)"
   return summary
 
 
@@ -607,8 +677,8 @@ def _print_logcat_results(
   """Prints the benchmark lines of a logcat, or its tail when the job failed.
 
   For a LiteRT-LM run (`lm`), the benchmark lines are the binary's
-  BenchmarkInfo blocks, followed by the medians over the iterations after the
-  first `warmup_iterations`.
+  BenchmarkInfo blocks and peak memory lines, followed by the medians over the
+  measured process's iterations after the first `warmup_iterations`.
   """
   lines = logcat_path.read_text(errors="replace").splitlines()
   if passed:
@@ -749,8 +819,8 @@ def run_ddp(
     prefill_tokens: Prefill tokens of a bundle's benchmark.
     decode_tokens: Decode tokens of a bundle's benchmark.
     max_num_tokens: Context length of a bundle's benchmark.
-    num_iterations: Prefill and decode cycles of a bundle's benchmark, in one
-      process.
+    num_iterations: Prefill and decode cycles of a bundle's benchmark, in the
+      measured process (the run script's warm-up process runs one first).
   """
   if accelerator == "npu":
     raise click.ClickException("NPU on --ddp is not supported yet.")
