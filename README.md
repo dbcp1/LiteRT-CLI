@@ -405,9 +405,11 @@ litert benchmark model.tflite --gcp --devices "pixel 7, sm-s931u1" --gpu
 litert benchmark model.tflite --ddp --device caiman-35 --gcp-project "your-gcp-project-id"
 litert benchmark model.tflite --ddp --devices "caiman-35, pa3q-35" --gpu --gcp-project "your-gcp-project-id"
 
-# A .litertlm bundle on DDP devices runs LiteRT-LM's benchmark binary: prefill and decode tokens/s
-# at --prefill-tokens / --decode-tokens (default 1024 / 256), --num-iterations times (default 5) in
-# one process; the printed medians leave out the first --warmup-runs iterations (default 1).
+# A .litertlm bundle on DDP devices runs LiteRT-LM's benchmark binary twice: a warm-up process (one
+# iteration, a cold Init) writes the caches beside the bundle, then the measured process loads them and
+# runs --num-iterations times (default 5) at --prefill-tokens / --decode-tokens (default 1024 / 256).
+# The printed medians leave out its first --warmup-runs iterations (default 1); the summary also shows
+# both Init times and the peak memory.
 litert benchmark model.litertlm --ddp --device caiman-35 --gpu --gcp-project "your-gcp-project-id"
 ```
 
