@@ -21,8 +21,10 @@ import pathlib
 import platform
 import subprocess
 import sys
+import tempfile
 
 import click
+from litert_cli.commands.benchmark import model_caches
 from litert_cli.core import constants
 import requests
 
@@ -129,6 +131,51 @@ def _ensure_desktop_binary(tool_name: str) -> pathlib.Path:
     ) from e
 
 
+def _run_benchmark(bench_args: list[str], *, show: bool) -> list[str]:
+  """Runs benchmark_model and returns its output lines.
+
+  With `show`, prints the lines the benchmark log filter keeps. Prints the
+  whole output and raises click.ClickException when the binary exits non-zero.
+  """
+  process = subprocess.Popen(
+      bench_args,
+      stdout=subprocess.PIPE,
+      stderr=subprocess.STDOUT,
+      text=True,
+  )
+
+  from litert_cli.core.log_filters import BenchmarkLogFilter
+
+  output_lines = []
+  log_filter = BenchmarkLogFilter(constants.DEFAULT_QUIET)
+
+  for line in process.stdout:
+    output_lines.append(line)
+    if show and log_filter.should_show(line):
+      click.echo(line, nl=False)
+
+  process.wait()
+  if process.returncode != 0:
+    click.secho(
+        f"Execution failed on desktop with exit code {process.returncode}",
+        fg="red",
+    )
+    click.echo("Full output for debugging:")
+    for line in output_lines:
+      click.echo(line, nl=False)
+    raise click.ClickException("Benchmark failed on desktop.")
+  return output_lines
+
+
+def _cache_files(cache_dir: str) -> dict[str, tuple[int, int]]:
+  """Size and modification time (ns) of each file in the cache directory."""
+  return {
+      p.name: (p.stat().st_size, p.stat().st_mtime_ns)
+      for p in pathlib.Path(cache_dir).iterdir()
+      if p.is_file()
+  }
+
+
 def run_desktop(
     *,
     model_path: pathlib.Path,
@@ -142,6 +189,9 @@ def run_desktop(
     signature_key: str | None = None,
 ) -> None:
   """Runs the benchmark_model binary on the local desktop machine.
+
+  On the CPU and the GPU the binary runs twice (see model_caches): a first
+  process writes the model caches, the measured process reads them.
 
   Args:
     model_path: Path to the local LiteRT model file.
@@ -195,33 +245,31 @@ def run_desktop(
     if signature_key:
       bench_args.append(f"--signature_to_run_for={signature_key}")
 
-    process = subprocess.Popen(
-        bench_args,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
-
-    from litert_cli.core.log_filters import BenchmarkLogFilter
-
-    output_lines = []
-    log_filter = BenchmarkLogFilter(constants.DEFAULT_QUIET)
-
-    for line in process.stdout:
-      output_lines.append(line)
-      if log_filter.should_show(line):
-        click.echo(line, nl=False)
-
-    process.wait()
-    if process.returncode != 0:
-      click.secho(
-          f"Execution failed on desktop with exit code {process.returncode}",
-          fg="red",
+    if not model_caches.uses_caches(accelerator):
+      _run_benchmark(bench_args, show=True)
+      return
+    # A fresh directory per run: the first process always compiles the model
+    # and writes the caches, the measured process reads them.
+    with tempfile.TemporaryDirectory(prefix="litert-benchmark-cache-") as d:
+      bench_args += model_caches.cache_args(accelerator, d, model_path.name)
+      click.echo("Writing the model caches (benchmark_model, no inference)...")
+      first = _run_benchmark(
+          bench_args + list(model_caches.WARMUP_ARGS),
+          show=not constants.DEFAULT_QUIET,
       )
-      click.echo("Full output for debugging:")
-      for line in output_lines:
-        click.echo(line, nl=False)
-      raise click.ClickException("Benchmark failed on desktop.")
+      written = _cache_files(d)
+      measured = _run_benchmark(
+          bench_args + [model_caches.PEAK_MEMORY_ARG], show=True
+      )
+      after = _cache_files(d)
+    for line in model_caches.report(
+        accelerator,
+        first,
+        measured,
+        {name: size for name, (size, _) in written.items()},
+        [name for name, stat in after.items() if written.get(name) != stat],
+    ):
+      click.secho(line, fg="green")
   except click.ClickException:
     raise
   except Exception as e:

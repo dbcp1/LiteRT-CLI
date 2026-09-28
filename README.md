@@ -365,6 +365,11 @@ litert run model.tflite \
 ### 6. Benchmark a LiteRT model
 
 ```bash
+# On the CPU and the GPU (--android, --desktop, --ddp), benchmark_model runs twice: a first process
+# compiles the model and writes the XNNPACK and GPU caches (no inference), then the measured process
+# reads them and reports the peak memory too. The GPU cache needs a benchmark_model with
+# --gpu_serialization_dir: the nightly binaries have it, 2.2.0 does not.
+
 # Benchmark on Android (CPU side)
 litert benchmark my_model_ref --android --cpu
 litert benchmark model.tflite --android --cpu
