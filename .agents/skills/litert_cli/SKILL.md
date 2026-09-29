@@ -271,7 +271,8 @@ litert benchmark model.tflite --android --cpu
 
 # On the CPU and the GPU (--android, --desktop, --ddp), benchmark_model runs twice: a first process writes the XNNPACK and
 # GPU caches (no inference), the measured process reads them and reports the peak memory. The GPU cache needs a
-# benchmark_model with --gpu_serialization_dir (nightly has it, 2.2.0 does not).
+# benchmark_model with --gpu_serialization_dir (nightly has it, 2.2.0 does not). If a process with the cache flags fails,
+# benchmark_model runs once without them, as before, and the report says so.
 
 # Benchmark on Android GPU using OpenCL/OpenGL delegates
 litert benchmark model.tflite --android --gpu

@@ -28,6 +28,9 @@ from litert_cli.commands.benchmark import cli as benchmark_cli
 from litert_cli.core import constants
 
 _ROOT = constants.LITERT_CLI_ANDROID_ROOT
+_PARSE_ERROR = (
+    "ERROR: Failed to parse flag 'dry_run' against argv '--dry_run=true'"
+)
 
 
 class _FakeAdb:
@@ -36,14 +39,24 @@ class _FakeAdb:
   Attributes:
     commands: every `adb shell` command string, in order; a benchmark run is
       recorded as ("run", command).
+    runs: every benchmark_model command line, in order.
   """
 
   def __init__(
-      self, *, fail_run=None, rewritten="", mkdir_fails=False, gpu_loaded=True
+      self,
+      *,
+      fail_runs=(),
+      reject_dry_run=False,
+      rewritten="",
+      mkdir_fails=False,
+      list_fails=False,
+      gpu_loaded=True,
   ):
-    self.fail_run = fail_run
+    self.fail_runs = fail_runs
+    self.reject_dry_run = reject_dry_run
     self.rewritten = rewritten
     self.mkdir_fails = mkdir_fails
+    self.list_fails = list_fails
     self.gpu_loaded = gpu_loaded
     self.commands = []
     self.runs = []
@@ -57,6 +70,8 @@ class _FakeAdb:
     ):
       return subprocess.CompletedProcess(cmd, 1, "mkdir: Permission denied\n")
     if "wc -c" in command:
+      if self.list_fails:
+        return subprocess.CompletedProcess(cmd, 1, "error: device offline\n")
       return subprocess.CompletedProcess(
           cmd,
           0,
@@ -72,18 +87,25 @@ class _FakeAdb:
     self.runs.append(cmd[2])
     self.commands.append(("run", cmd[2]))
     n = len(self.runs)
-    lines = [
-        f"INFO: [benchmark_litert_model.h:94] Model initialization: {n}0.00"
-        " ms\n",
-        "noise line\n",
-    ]
-    if n == 2 and self.gpu_loaded and "--use_gpu=true" in cmd[2]:
-      lines.insert(
-          0, "I0000 Initialized InferenceContext from serialized data.\n"
-      )
+    lines = ["INFO: STARTING!\n"]
     process = mock.MagicMock()
+    process.returncode = 0
+    if self.reject_dry_run and "--dry_run=true" in cmd[2]:
+      lines.append(_PARSE_ERROR + "\n")
+      process.returncode = 1
+    elif n in self.fail_runs:
+      process.returncode = 7
+    else:
+      if n == 2 and self.gpu_loaded and "--use_gpu=true" in cmd[2]:
+        lines.append(
+            "I0000 Initialized InferenceContext from serialized data.\n"
+        )
+      lines += [
+          f"INFO: [benchmark_litert_model.h:94] Model initialization: {n}0.00"
+          " ms\n",
+          "noise line\n",
+      ]
     process.stdout = iter(lines)
-    process.returncode = 7 if n == self.fail_run else 0
     return process
 
 
@@ -97,6 +119,7 @@ class RunAndroidTest(absltest.TestCase):
     self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
     self.model = self.dir / "m.tflite"
     self.model.write_bytes(b"\0")
+    self.plain = f"{_ROOT}/benchmark_model --graph={_ROOT}/m.tflite"
 
   def _invoke(self, fake: _FakeAdb, *extra_args: str) -> testing.Result:
     with (
@@ -144,6 +167,9 @@ class RunAndroidTest(absltest.TestCase):
     ][:1]
     return mkdir.split()[-1]
 
+  def _steps(self, fake: _FakeAdb) -> list[str]:
+    return [c if isinstance(c, str) else c[0] for c in fake.commands]
+
   def test_the_first_process_writes_the_caches_the_measured_one_reads(self):
     fake = _FakeAdb()
     result = self._invoke(fake, "--gpu")
@@ -156,17 +182,15 @@ class RunAndroidTest(absltest.TestCase):
         f" --gpu_serialization_dir={cache} --gpu_model_cache_key=m"
     )
     self.assertEqual(
-        first,
-        f"{_ROOT}/benchmark_model --graph={_ROOT}/m.tflite --use_gpu=true"
-        f" {cache_args} --dry_run=true",
+        first, f"{self.plain} --use_gpu=true {cache_args} --dry_run=true"
     )
     self.assertEqual(
         measured,
-        f"{_ROOT}/benchmark_model --graph={_ROOT}/m.tflite --use_gpu=true"
-        f" {cache_args} --report_peak_memory_footprint=true",
+        f"{self.plain} --use_gpu=true {cache_args}"
+        " --report_peak_memory_footprint=true",
     )
     # mkdir, first process, sizes + mark, measured process, find, cleanup.
-    steps = [c if isinstance(c, str) else c[0] for c in fake.commands]
+    steps = self._steps(fake)
     self.assertEqual(steps[-6], f"mkdir -p {cache}")
     self.assertEqual(steps[-5], "run")
     self.assertEqual(
@@ -174,10 +198,14 @@ class RunAndroidTest(absltest.TestCase):
         f"cd {cache} && wc -c * 2>/dev/null; touch {cache}.written",
     )
     self.assertEqual(steps[-3], "run")
-    self.assertEqual(steps[-2], f"find {cache} -type f -newer {cache}.written")
+    self.assertEqual(
+        steps[-2],
+        f"find {cache} -type f -newer {cache}.written 2>/dev/null",
+    )
     self.assertEqual(steps[-1], f"rm -rf {cache} {cache}.written")
     self.assertIn("Model initialization: 20.00 ms", result.output)
     self.assertNotIn("Model initialization: 10.00 ms", result.output)
+    self.assertIn("Model caches: on\n", result.output)
     self.assertIn(
         "First process (compiles the model and writes the caches, no"
         " inference): init 10.00 ms",
@@ -194,6 +222,7 @@ class RunAndroidTest(absltest.TestCase):
         " serialized data",
         result.output,
     )
+    self.assertNotIn("without the cache flags", result.output)
 
   def test_the_cache_flags_are_quoted_for_the_device_shell(self):
     self.model = self.dir / "my model.tflite"
@@ -225,30 +254,106 @@ class RunAndroidTest(absltest.TestCase):
         result.output,
     )
 
-  def test_a_failing_first_process_exits_1_and_removes_the_caches(self):
-    fake = _FakeAdb(fail_run=1)
+  def test_a_failing_first_process_runs_one_process_without_the_flags(self):
+    fake = _FakeAdb(fail_runs=(1,))
+    result = self._invoke(fake, "--cpu")
+    self.assertEqual(result.exit_code, 0, result.output)
+    first, fallback = fake.runs
+    self.assertIn("--dry_run=true", first)
+    self.assertEqual(fallback, self.plain)
+    # The caches are removed before the process without the flags runs.
+    steps = self._steps(fake)
+    self.assertEqual(steps[-3:], [
+        "run",
+        f"rm -rf {self._cache_dir(fake)} {self._cache_dir(fake)}.written",
+        "run",
+    ])
+    self.assertIn("Execution failed on device with exit code 7", result.output)
+    self.assertIn(
+        "Last 1 lines of its output (LITERT_VERBOSE=1 shows all of it):\n"
+        "INFO: STARTING!\n",
+        result.output,
+    )
+    self.assertIn(
+        "Running benchmark_model once without the cache flags: the first"
+        " process exited with 7\n",
+        result.output,
+    )
+    self.assertIn("Model initialization: 20.00 ms", result.output)
+    self.assertIn(
+        "Model caches: off (the first process exited with 7): benchmark_model"
+        " ran once without the cache flags, so the results above are a cold"
+        " start with no peak memory\n",
+        result.output,
+    )
+    self.assertNotIn("Error:", result.output)
+
+  def test_a_failing_measured_process_runs_one_process_without_the_flags(
+      self,
+  ):
+    fake = _FakeAdb(fail_runs=(2,))
+    result = self._invoke(fake, "--cpu")
+    self.assertEqual(result.exit_code, 0, result.output)
+    self.assertLen(fake.runs, 3)
+    self.assertEqual(fake.runs[2], self.plain)
+    self.assertIn(
+        "Model caches: off (the measured process exited with 7)",
+        result.output,
+    )
+    self.assertIn("Model initialization: 30.00 ms", result.output)
+    self.assertNotIn("Model initialization: 20.00 ms", result.output)
+
+  def test_a_failing_measured_process_and_a_failing_fallback_exit_1(self):
+    fake = _FakeAdb(fail_runs=(2, 3))
     result = self._invoke(fake, "--cpu")
     self.assertEqual(result.exit_code, 1)
-    self.assertLen(fake.runs, 1)
-    self.assertIn("Execution failed on device with exit code 7", result.output)
+    self.assertLen(fake.runs, 3)
     self.assertIn("Error: Benchmark failed on device.\n", result.output)
-    self.assertNotIn("Failed to execute benchmark on device", result.output)
-    self.assertTrue(fake.commands[-1].startswith("rm -rf "))
 
-  def test_a_failing_measured_process_exits_1_and_removes_the_caches(self):
-    fake = _FakeAdb(fail_run=2)
+  def test_a_binary_that_rejects_dry_run_is_quoted_in_the_report(self):
+    fake = _FakeAdb(reject_dry_run=True)
+    result = self._invoke(fake, "--cpu")
+    self.assertEqual(result.exit_code, 0, result.output)
+    self.assertLen(fake.runs, 2)
+    self.assertIn(
+        "Model caches: off (the first process exited with 1)", result.output
+    )
+    self.assertIn(
+        "The first process logged: Failed to parse flag 'dry_run' against"
+        " argv '--dry_run=true'\n",
+        result.output,
+    )
+
+  def test_a_failing_process_without_the_flags_exits_1(self):
+    fake = _FakeAdb(fail_runs=(1, 2))
     result = self._invoke(fake, "--cpu")
     self.assertEqual(result.exit_code, 1)
     self.assertLen(fake.runs, 2)
-    self.assertTrue(fake.commands[-1].startswith("rm -rf "))
-    self.assertNotIn("First process", result.output)
+    self.assertIn("Full output for debugging:", result.output)
+    self.assertIn("Error: Benchmark failed on device.\n", result.output)
+    self.assertNotIn("Failed to execute benchmark on device", result.output)
+    self.assertNotIn("Model caches:", result.output)
 
-  def test_a_cache_directory_that_cannot_be_made_exits_1(self):
+  def test_a_cache_directory_that_cannot_be_made_runs_one_process(self):
     fake = _FakeAdb(mkdir_fails=True)
     result = self._invoke(fake, "--cpu")
-    self.assertEqual(result.exit_code, 1)
-    self.assertEmpty(fake.runs)
-    self.assertIn("mkdir: Permission denied", result.output)
+    self.assertEqual(result.exit_code, 0, result.output)
+    self.assertEqual(fake.runs, [self.plain])
+    cache = self._cache_dir(fake)
+    self.assertIn(
+        f"Model caches: off ('adb shell mkdir -p {cache}' exited with 1:"
+        " mkdir: Permission denied)",
+        result.output,
+    )
+
+  def test_a_cache_listing_that_fails_does_not_stop_the_run(self):
+    fake = _FakeAdb(list_fails=True)
+    result = self._invoke(fake, "--cpu")
+    self.assertEqual(result.exit_code, 0, result.output)
+    self.assertLen(fake.runs, 2)
+    self.assertIn("Model caches: on\n", result.output)
+    self.assertIn("Could not list the cache files it wrote\n", result.output)
+    self.assertNotIn("Caches it wrote", result.output)
 
   def test_npu_runs_once_without_the_cache_flags(self):
     fake = _FakeAdb()
@@ -258,6 +363,7 @@ class RunAndroidTest(absltest.TestCase):
     self.assertIn("--use_npu=true", run)
     self.assertNotIn("cache", run)
     self.assertFalse(any("benchmark_cache_" in str(c) for c in fake.commands))
+    self.assertNotIn("Model caches", result.output)
 
 
 if __name__ == "__main__":

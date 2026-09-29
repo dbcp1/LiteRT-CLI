@@ -131,11 +131,14 @@ def _ensure_desktop_binary(tool_name: str) -> pathlib.Path:
     ) from e
 
 
-def _run_benchmark(bench_args: list[str], *, show: bool) -> list[str]:
-  """Runs benchmark_model and returns its output lines.
+def _run_benchmark(
+    bench_args: list[str], *, show: bool, or_fail: bool = False
+) -> tuple[int, list[str]]:
+  """Runs benchmark_model and returns its exit code and output lines.
 
-  With `show`, prints the lines the benchmark log filter keeps. Prints the
-  whole output and raises click.ClickException when the binary exits non-zero.
+  With `show`, prints the lines the benchmark log filter keeps. With
+  `or_fail`, a non-zero exit prints the whole output and raises
+  click.ClickException.
   """
   process = subprocess.Popen(
       bench_args,
@@ -155,7 +158,7 @@ def _run_benchmark(bench_args: list[str], *, show: bool) -> list[str]:
       click.echo(line, nl=False)
 
   process.wait()
-  if process.returncode != 0:
+  if process.returncode != 0 and or_fail:
     click.secho(
         f"Execution failed on desktop with exit code {process.returncode}",
         fg="red",
@@ -164,16 +167,99 @@ def _run_benchmark(bench_args: list[str], *, show: bool) -> list[str]:
     for line in output_lines:
       click.echo(line, nl=False)
     raise click.ClickException("Benchmark failed on desktop.")
-  return output_lines
+  return process.returncode, output_lines
+
+
+def _show_benchmark_lines(output_lines: list[str]) -> None:
+  """Prints the lines the benchmark log filter keeps."""
+  from litert_cli.core.log_filters import BenchmarkLogFilter
+
+  log_filter = BenchmarkLogFilter(constants.DEFAULT_QUIET)
+  for line in output_lines:
+    if log_filter.should_show(line):
+      click.echo(line, nl=False)
+
+
+def _print_failure(returncode: int, output_lines: list[str]) -> None:
+  """Prints the tail of a failed process that the run goes on without."""
+  click.secho(
+      f"Execution failed on desktop with exit code {returncode}", fg="red"
+  )
+  tail = output_lines[-model_caches.OUTPUT_TAIL_LINES :]
+  hint = (
+      ""
+      if not constants.DEFAULT_QUIET
+      else f" ({constants.ENV_LITERT_VERBOSE}=1 shows all of it)"
+  )
+  click.echo(f"Last {len(tail)} lines of its output{hint}:")
+  for line in tail:
+    click.echo(line, nl=False)
 
 
 def _cache_files(cache_dir: str) -> dict[str, tuple[int, int]]:
-  """Size and modification time (ns) of each file in the cache directory."""
-  return {
-      p.name: (p.stat().st_size, p.stat().st_mtime_ns)
-      for p in pathlib.Path(cache_dir).iterdir()
-      if p.is_file()
-  }
+  """Size and modification time (ns) of each file in the cache directory.
+
+  A file that disappears between the listing and its stat is left out.
+  """
+  files = {}
+  for path in pathlib.Path(cache_dir).iterdir():
+    try:
+      stat = path.stat()
+    except OSError:
+      continue
+    if path.is_file():
+      files[path.name] = (stat.st_size, stat.st_mtime_ns)
+  return files
+
+
+def _run_with_caches(
+    bench_args: list[str], model_name: str, accelerator: str
+) -> model_caches.Outcome:
+  """Runs the first and the measured process in a fresh cache directory.
+
+  Returns what they did. `fallback` is set when a process exited non-zero
+  or the directory could not be made; the caller then runs benchmark_model
+  once without the cache flags.
+  """
+  outcome = model_caches.Outcome()
+  try:
+    cache_dir = tempfile.TemporaryDirectory(prefix="litert-benchmark-cache-")
+  except OSError as e:
+    outcome.fallback = f"could not make a cache directory ({e})"
+    return outcome
+  # A fresh directory per run: the first process always compiles the model
+  # and writes the caches, the measured process reads them.
+  with cache_dir as d:
+    cache_flags = model_caches.cache_args(accelerator, d, model_name)
+    click.echo("Writing the model caches (benchmark_model, no inference)...")
+    returncode, outcome.first = _run_benchmark(
+        bench_args + cache_flags + list(model_caches.WARMUP_ARGS),
+        show=not constants.DEFAULT_QUIET,
+    )
+    if returncode != 0:
+      _print_failure(returncode, outcome.first)
+      outcome.fallback = f"the first process exited with {returncode}"
+      return outcome
+    written = _cache_files(d)
+    # Shown once it exited 0, so the numbers of a process that fails after
+    # printing them are not shown as results (_print_failure shows its last
+    # lines); verbose mode streams everything.
+    returncode, outcome.measured = _run_benchmark(
+        bench_args + cache_flags + [model_caches.PEAK_MEMORY_ARG],
+        show=not constants.DEFAULT_QUIET,
+    )
+    if returncode != 0:
+      _print_failure(returncode, outcome.measured)
+      outcome.fallback = f"the measured process exited with {returncode}"
+      return outcome
+    if constants.DEFAULT_QUIET:
+      _show_benchmark_lines(outcome.measured)
+    after = _cache_files(d)
+  outcome.written = {name: size for name, (size, _) in written.items()}
+  outcome.rewritten = [
+      name for name, stat in after.items() if written.get(name) != stat
+  ]
+  return outcome
 
 
 def run_desktop(
@@ -191,7 +277,8 @@ def run_desktop(
   """Runs the benchmark_model binary on the local desktop machine.
 
   On the CPU and the GPU the binary runs twice (see model_caches): a first
-  process writes the model caches, the measured process reads them.
+  process writes the model caches, the measured process reads them. When
+  one of them fails, the binary runs once more without the cache flags.
 
   Args:
     model_path: Path to the local LiteRT model file.
@@ -215,6 +302,7 @@ def run_desktop(
   benchmark_bin = _ensure_desktop_binary("benchmark_model")
 
   click.echo(f"Executing benchmark locally using {benchmark_bin.name}...\n")
+  outcome = None
   try:
     bench_args = [
         str(benchmark_bin),
@@ -245,32 +333,20 @@ def run_desktop(
     if signature_key:
       bench_args.append(f"--signature_to_run_for={signature_key}")
 
-    if not model_caches.uses_caches(accelerator):
-      _run_benchmark(bench_args, show=True)
-      return
-    # A fresh directory per run: the first process always compiles the model
-    # and writes the caches, the measured process reads them.
-    with tempfile.TemporaryDirectory(prefix="litert-benchmark-cache-") as d:
-      bench_args += model_caches.cache_args(accelerator, d, model_path.name)
-      click.echo("Writing the model caches (benchmark_model, no inference)...")
-      first = _run_benchmark(
-          bench_args + list(model_caches.WARMUP_ARGS),
-          show=not constants.DEFAULT_QUIET,
-      )
-      written = _cache_files(d)
-      measured = _run_benchmark(
-          bench_args + [model_caches.PEAK_MEMORY_ARG], show=True
-      )
-      after = _cache_files(d)
-    for line in model_caches.report(
-        accelerator,
-        first,
-        measured,
-        {name: size for name, (size, _) in written.items()},
-        [name for name, stat in after.items() if written.get(name) != stat],
-    ):
-      click.secho(line, fg="green")
+    if model_caches.uses_caches(accelerator):
+      outcome = _run_with_caches(bench_args, model_path.name, accelerator)
+    if outcome is None or outcome.fallback is not None:
+      if outcome is not None:
+        click.secho(
+            "Running benchmark_model once without the cache flags:"
+            f" {outcome.fallback}",
+            fg="yellow",
+        )
+      _run_benchmark(bench_args, show=True, or_fail=True)
   except click.ClickException:
     raise
   except Exception as e:
     raise click.ClickException(f"Failed to execute benchmark on desktop: {e}")
+  if outcome is not None:
+    for line in model_caches.report(accelerator, outcome):
+      click.secho(line, fg="green")

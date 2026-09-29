@@ -105,6 +105,7 @@ def run_android(
   )
 
   click.echo("Executing benchmark on device...\n")
+  outcome = None
   try:
     bench_args = [
         f"{cli_android_root}/benchmark_model",
@@ -153,104 +154,156 @@ def run_android(
           f"ADSP_LIBRARY_PATH={quoted_dispatch_dir} "
       )
 
-    if not model_caches.uses_caches(accelerator):
-      _run_on_device(env_vars + " ".join(bench_args), show=True)
-      return
-    # A fresh directory per run: the first process always compiles the model
-    # and writes the caches, the measured process reads them.
-    cache_dir = f"{cli_android_root}/benchmark_cache_{uuid.uuid4().hex[:8]}"
-    written_mark = f"{cache_dir}.written"
-    _adb_shell(f"mkdir -p {shlex.quote(cache_dir)}")
-    try:
-      bench_args += [
-          shlex.quote(arg)
-          for arg in model_caches.cache_args(
-              accelerator, cache_dir, model_name
-          )
-      ]
-      click.echo("Writing the model caches (benchmark_model, no inference)...")
-      first = _run_on_device(
-          env_vars + " ".join(bench_args + list(model_caches.WARMUP_ARGS)),
-          show=not constants.DEFAULT_QUIET,
-      )
-      written = {}
-      for line in _adb_shell(
-          f"cd {shlex.quote(cache_dir)} && wc -c * 2>/dev/null;"
-          f" touch {shlex.quote(written_mark)}"
-      ).splitlines():
-        size, _, name = line.strip().partition(" ")
-        if size.isdigit() and name and name != "total":
-          written[name] = int(size)
-      measured = _run_on_device(
-          env_vars
-          + " ".join(bench_args + [model_caches.PEAK_MEMORY_ARG]),
-          show=True,
-      )
-      found = subprocess.run(
-          [
-              "adb",
-              "shell",
-              f"find {shlex.quote(cache_dir)} -type f"
-              f" -newer {shlex.quote(written_mark)}",
-          ],
-          stdout=subprocess.PIPE,
-          stderr=subprocess.DEVNULL,
-          text=True,
-          check=False,
-      )
-      rewritten = (
-          [
-              line.strip().rsplit("/", 1)[-1]
-              for line in found.stdout.splitlines()
-              if line.strip()
-          ]
-          if found.returncode == 0
-          else None
-      )
-    finally:
-      subprocess.run(
-          [
-              "adb",
-              "shell",
-              f"rm -rf {shlex.quote(cache_dir)} {shlex.quote(written_mark)}",
-          ],
-          check=False,
-      )
-    for line in model_caches.report(
-        accelerator, first, measured, written, rewritten
-    ):
-      click.secho(line, fg="green")
+    if model_caches.uses_caches(accelerator):
+      outcome = _run_with_caches(env_vars, bench_args, model_name, accelerator)
+    if outcome is None or outcome.fallback is not None:
+      if outcome is not None:
+        click.secho(
+            "Running benchmark_model once without the cache flags:"
+            f" {outcome.fallback}",
+            fg="yellow",
+        )
+      _run_on_device(env_vars + " ".join(bench_args), show=True, or_fail=True)
   except click.ClickException:
     raise
   except Exception as e:
     raise click.ClickException(f"Failed to execute benchmark on device: {e}")
+  if outcome is not None:
+    for line in model_caches.report(accelerator, outcome):
+      click.secho(line, fg="green")
 
 
-def _adb_shell(command: str) -> str:
-  """Runs a shell command on the device and returns its output.
+def _run_with_caches(
+    env_vars: str, bench_args: list[str], model_name: str, accelerator: str
+) -> model_caches.Outcome:
+  """Runs the first and the measured process in a fresh cache directory.
 
-  Raises click.ClickException with the output when it exits non-zero.
+  Returns what they did. `fallback` is set when a process exited non-zero
+  or the directory could not be made; the caller then runs benchmark_model
+  once without the cache flags. The directory is removed either way.
   """
-  result = subprocess.run(
+  outcome = model_caches.Outcome()
+  # A fresh directory per run: the first process always compiles the model
+  # and writes the caches, the measured process reads them.
+  cache_dir = (
+      f"{constants.LITERT_CLI_ANDROID_ROOT}/benchmark_cache_"
+      f"{uuid.uuid4().hex[:8]}"
+  )
+  written_mark = f"{cache_dir}.written"
+  made = _adb_shell(f"mkdir -p {shlex.quote(cache_dir)}")
+  if made.returncode != 0:
+    detail = made.stdout.strip().splitlines()
+    outcome.fallback = (
+        f"'adb shell mkdir -p {cache_dir}' exited with {made.returncode}"
+        + (f": {detail[-1]}" if detail else "")
+    )
+    return outcome
+  try:
+    cache_flags = [
+        shlex.quote(arg)
+        for arg in model_caches.cache_args(accelerator, cache_dir, model_name)
+    ]
+    click.echo("Writing the model caches (benchmark_model, no inference)...")
+    returncode, outcome.first = _run_on_device(
+        env_vars
+        + " ".join(bench_args + cache_flags + list(model_caches.WARMUP_ARGS)),
+        show=not constants.DEFAULT_QUIET,
+    )
+    if returncode != 0:
+      _print_failure(returncode, outcome.first)
+      outcome.fallback = f"the first process exited with {returncode}"
+      return outcome
+    listed = _adb_shell(
+        f"cd {shlex.quote(cache_dir)} && wc -c * 2>/dev/null;"
+        f" touch {shlex.quote(written_mark)}"
+    )
+    if listed.returncode == 0:
+      outcome.written = {}
+      for line in listed.stdout.splitlines():
+        size, _, name = line.strip().partition(" ")
+        if size.isdigit() and name and name != "total":
+          outcome.written[name] = int(size)
+    # Shown once it exited 0, so the numbers of a process that fails after
+    # printing them are not shown as results (_print_failure shows its last
+    # lines); verbose mode streams everything.
+    returncode, outcome.measured = _run_on_device(
+        env_vars
+        + " ".join(bench_args + cache_flags + [model_caches.PEAK_MEMORY_ARG]),
+        show=not constants.DEFAULT_QUIET,
+    )
+    if returncode != 0:
+      _print_failure(returncode, outcome.measured)
+      outcome.fallback = f"the measured process exited with {returncode}"
+      return outcome
+    if constants.DEFAULT_QUIET:
+      _show_benchmark_lines(outcome.measured)
+    found = _adb_shell(
+        f"find {shlex.quote(cache_dir)} -type f"
+        f" -newer {shlex.quote(written_mark)} 2>/dev/null"
+    )
+    if found.returncode == 0:
+      outcome.rewritten = [
+          line.strip().rsplit("/", 1)[-1]
+          for line in found.stdout.splitlines()
+          if line.strip()
+      ]
+    return outcome
+  finally:
+    subprocess.run(
+        [
+            "adb",
+            "shell",
+            f"rm -rf {shlex.quote(cache_dir)} {shlex.quote(written_mark)}",
+        ],
+        check=False,
+    )
+
+
+def _adb_shell(command: str) -> subprocess.CompletedProcess[str]:
+  """Runs a shell command on the device; its output is in stdout."""
+  return subprocess.run(
       ["adb", "shell", command],
       stdout=subprocess.PIPE,
       stderr=subprocess.STDOUT,
       text=True,
       check=False,
   )
-  if result.returncode != 0:
-    raise click.ClickException(
-        f"'adb shell {command}' failed with exit code {result.returncode}:\n"
-        f"{result.stdout}"
-    )
-  return result.stdout
 
 
-def _run_on_device(full_command: str, *, show: bool) -> list[str]:
-  """Runs benchmark_model on the device and returns its output lines.
+def _show_benchmark_lines(output_lines: list[str]) -> None:
+  """Prints the lines the benchmark log filter keeps."""
+  from litert_cli.core.log_filters import BenchmarkLogFilter
 
-  With `show`, prints the lines the benchmark log filter keeps. Prints the
-  whole output and raises click.ClickException when the binary exits non-zero.
+  log_filter = BenchmarkLogFilter(constants.DEFAULT_QUIET)
+  for line in output_lines:
+    if log_filter.should_show(line):
+      click.echo(line, nl=False)
+
+
+def _print_failure(returncode: int, output_lines: list[str]) -> None:
+  """Prints the tail of a failed process that the run goes on without."""
+  click.secho(
+      f"Execution failed on device with exit code {returncode}", fg="red"
+  )
+  tail = output_lines[-model_caches.OUTPUT_TAIL_LINES :]
+  hint = (
+      ""
+      if not constants.DEFAULT_QUIET
+      else f" ({constants.ENV_LITERT_VERBOSE}=1 shows all of it)"
+  )
+  click.echo(f"Last {len(tail)} lines of its output{hint}:")
+  for line in tail:
+    click.echo(line, nl=False)
+
+
+def _run_on_device(
+    full_command: str, *, show: bool, or_fail: bool = False
+) -> tuple[int, list[str]]:
+  """Runs benchmark_model on the device; returns its exit code and output.
+
+  With `show`, prints the lines the benchmark log filter keeps. With
+  `or_fail`, a non-zero exit prints the whole output and raises
+  click.ClickException.
   """
   process = subprocess.Popen(
       ["adb", "shell", full_command],
@@ -270,7 +323,7 @@ def _run_on_device(full_command: str, *, show: bool) -> list[str]:
       click.echo(line, nl=False)
 
   process.wait()
-  if process.returncode != 0:
+  if process.returncode != 0 and or_fail:
     click.secho(
         f"Execution failed on device with exit code {process.returncode}",
         fg="red",
@@ -279,4 +332,4 @@ def _run_on_device(full_command: str, *, show: bool) -> list[str]:
     for line in output_lines:
       click.echo(line, nl=False)
     raise click.ClickException("Benchmark failed on device.")
-  return output_lines
+  return process.returncode, output_lines

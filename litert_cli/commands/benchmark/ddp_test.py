@@ -392,6 +392,14 @@ class DdpHelpersTest(absltest.TestCase):
     self.assertIn("--input_layer_value_range=input1,1.0,2.0", args)
     self.assertIn("--signature_to_run_for=serving_default", args)
 
+  def test_tflite_execution_timeout_follows_max_secs_within_the_range(self):
+    self.assertEqual(ddp._tflite_execution_timeout_secs(150.0), 420)
+    # Never below the platform's default of 300 s, which a job without a
+    # timeout got before.
+    self.assertEqual(ddp._tflite_execution_timeout_secs(90.0), 300)
+    self.assertEqual(ddp._tflite_execution_timeout_secs(1.0), 300)
+    self.assertEqual(ddp._tflite_execution_timeout_secs(10000.0), 3600)
+
   def test_build_session_request_one_job_per_device(self):
     body = ddp._build_session_request(
         session_name=_SESSION_NAME,
@@ -539,7 +547,7 @@ class RunDdpTest(absltest.TestCase):
         "https://devicerun.googleapis.com/v1alpha/projects/p/locations/"
         "global/operations/op-1",
     )
-    self.assertIn("timeout: 750 s", result.output)
+    self.assertIn("timeout: 1020 s", result.output)
     self.assertIn("Session 's-1' finished: PASSED", result.output)
     self.assertIn(
         str(pathlib.Path(self.tmp_dir) / "ddp" / "s-1" / "cpu-caiman-35"),
@@ -582,10 +590,18 @@ class RunDdpTest(absltest.TestCase):
             f"--gpu_serialization_dir={cache}",
             "--gpu_model_cache_key=m",
         ]
+      # The job's arguments are the plain ones, as without the caches; the
+      # script adds the cache flags.
       self.assertEqual(
-          binary["args"][-len(expected_cache_args) - 1 :],
-          expected_cache_args + ["--report_peak_memory_footprint=true"],
+          binary["args"][-2:],
+          [
+              f"--result_file_path={_ROOT}/results.pb",
+              f"--model_runtime_info_output_file={_ROOT}/runtime_info.pb",
+          ],
       )
+      self.assertFalse(any("cache" in arg for arg in binary["args"]))
+      self.assertEqual(binary["executionTimeout"], "420s")
+      self.assertEqual(job["labels"]["model_caches"], "on")
       actions = job["allocationConfig"]["deviceConfigs"][0]["actions"]
       pushes = [
           (f["sourceFile"]["gcsInputFile"]["path"], f["destinationPath"])
@@ -607,17 +623,26 @@ class RunDdpTest(absltest.TestCase):
               f"{_ROOT}/benchmark_run.txt",
           ],
       )
-      # The script carries the first process's command.
+      # The script carries the first process's arguments, the flags the
+      # measured process gets on top of the job's, and the run without them.
       script = fake.uploads["benchmark_model_run.sh"]
       self.assertTrue(script.startswith("#!/system/bin/sh\n"))
       self.assertIn(
-          "./benchmark_model "
-          + " ".join(ddp._tflite_warmup_args(binary["args"]))
-          + " &\n",
+          "run first "
+          + " ".join(
+              ddp._tflite_warmup_args(binary["args"], expected_cache_args)
+          )
+          + "; then\n",
           script,
       )
+      self.assertIn(
+          'run measured "$@" '
+          + " ".join(expected_cache_args)
+          + " --report_peak_memory_footprint=true; then\n",
+          script,
+      )
+      self.assertIn('run fallback "$@" || stop', script)
       self.assertIn(f'ROOT="{_ROOT}"', script)
-      self.assertIn('./benchmark_model "$@" &\n', script)
 
   def test_the_report_follows_the_accelerator(self):
     logcat = _tflite_process("4000", "745.16") + _tflite_process(
@@ -690,7 +715,14 @@ class RunDdpTest(absltest.TestCase):
         fake, "--devices", "caiman-35, pa3q-35", "--max-secs", "10"
     )
     self.assertEqual(result.exit_code, 0, result.output)
-    self.assertIn("timeout: 620 s", result.output)
+    # Two jobs of max(300, 2 x 10 + 120) s, and the slack.
+    self.assertIn("timeout: 1200 s", result.output)
+    self.assertEqual(
+        json.loads(fake.requests[0].data.decode())["sessionConfig"][
+            "jobConfigs"
+        ][0]["action"]["androidNativeBinary"]["executionTimeout"],
+        "300s",
+    )
 
   def test_missing_bucket_is_created(self):
     fake = _FakeCloud(
@@ -943,25 +975,36 @@ class RunDdpTest(absltest.TestCase):
 # cache files its flags name on the first call, and on the second too when
 # rewrite exists; writes its result file. Like benchmark_model, it keeps the
 # first copy of a repeated flag.
+# Logs its arguments to calls.txt, one call per "--" line. Exits 7 on call N
+# when fail<N> exists (leaving a partial result file, as a crash might, unless
+# silent<N> exists too), sleeps on call N when slow<N> exists, and exits 1 on a
+# call with --dry_run=true when reject exists. Writes the cache files its flags
+# name on the first call, and on the second too when rewrite exists, and writes
+# the call's number into its result file. Like benchmark_model, it keeps the
+# first copy of a repeated flag.
 _FAKE_BENCHMARK_MODEL = """#!/bin/sh
 dir=$(dirname "$0")
 printf '%s\\n' "$@" -- >> "$dir/calls.txt"
 n=$(grep -c -- '^--$' "$dir/calls.txt")
-[ -f "$dir/fail$n" ] && exit 7
-if [ -f "$dir/slow$n" ]; then echo $$ > "$dir/fake.pid"; exec sleep 30; fi
 for arg in "$@"; do
   case "$arg" in
+    --dry_run=true) [ -f "$dir/reject" ] && exit 1 ;;
     --xnnpack_weight_cache_file_path=*) [ -n "$x" ] || x="${arg#*=}" ;;
     --gpu_serialization_dir=*) [ -n "$g" ] || g="${arg#*=}" ;;
     --gpu_model_cache_key=*) [ -n "$k" ] || k="${arg#*=}" ;;
     --result_file_path=*) [ -n "$r" ] || r="${arg#*=}" ;;
   esac
 done
+if [ -f "$dir/fail$n" ]; then
+  [ -n "$r" ] && [ ! -f "$dir/silent$n" ] && printf "partial$n" > "$r"
+  exit 7
+fi
+if [ -f "$dir/slow$n" ]; then echo $$ > "$dir/fake.pid"; exec sleep 30; fi
 if [ "$n" = 1 ] || [ -f "$dir/rewrite" ]; then
   [ -n "$x" ] && printf x > "$x"
   [ -n "$g" ] && printf gg > "$g/${k}_mldrift_program_cache.bin"
 fi
-[ -n "$r" ] && printf r > "$r"
+[ -n "$r" ] && printf "r$n" > "$r"
 exit 0
 """
 
@@ -1028,7 +1071,7 @@ class TfliteRunScriptTest(absltest.TestCase):
         constants, "LITERT_CLI_ANDROID_ROOT", str(self.root)
     )
     with root:
-      self.args = ddp._build_benchmark_args(
+      self.plain = ddp._build_benchmark_args(
           model_name="m.tflite",
           accelerator="gpu",
           num_runs=50,
@@ -1038,11 +1081,17 @@ class TfliteRunScriptTest(absltest.TestCase):
           warmup_min_secs=0.5,
           input_layer_value_range=None,
           signature_key=None,
-      ) + model_caches.cache_args("gpu", str(cache), "m.tflite")
-      self.args.append(model_caches.PEAK_MEMORY_ARG)
-      self.warmup = ddp._tflite_warmup_args(self.args)
+      )
+      cache_flags = model_caches.cache_args("gpu", str(cache), "m.tflite")
+      self.warmup = ddp._tflite_warmup_args(self.plain, cache_flags)
+      self.measured = (
+          self.plain + cache_flags + [model_caches.PEAK_MEMORY_ARG]
+      )
+      # The job's arguments are the plain ones; the script adds the rest.
+      script, self.args = ddp._tflite_job("m.tflite", "gpu", self.plain)
+      self.assertEqual(self.args, self.plain)
       self.script = self.root / "benchmark_model_run.sh"
-      self.script.write_text(ddp._tflite_run_script("m.tflite", self.warmup))
+      self.script.write_text(script)
 
   def _run(self) -> subprocess.CompletedProcess[str]:
     calls = self.root / "calls.txt"
@@ -1067,6 +1116,7 @@ class TfliteRunScriptTest(absltest.TestCase):
     (self.root / "benchmark_cache").mkdir()
     (self.root / "benchmark_cache" / "stale.bin").write_text("old")
     (self.root / "benchmark_run.txt").write_text("measured process: pid 1\n")
+    (self.root / "runtime_info.pb").write_text("stale")
     result = self._run()
     self.assertEqual(result.returncode, 0, result.stderr)
     first, measured = self._calls()
@@ -1075,10 +1125,12 @@ class TfliteRunScriptTest(absltest.TestCase):
     self.assertIn(f"--result_file_path={self.root}/warmup_results.pb", first)
     self.assertNotIn(model_caches.PEAK_MEMORY_ARG, first)
     self.assertFalse(any("runtime_info" in arg for arg in first))
-    self.assertEqual(measured, self.args)
-    self.assertTrue((self.root / "warmup_results.pb").exists())
-    self.assertTrue((self.root / "results.pb").exists())
-    # The earlier run's cache is gone; the script removes its directory after.
+    self.assertEqual(measured, self.measured)
+    self.assertEqual((self.root / "warmup_results.pb").read_text(), "r1")
+    self.assertEqual((self.root / "results.pb").read_text(), "r2")
+    # The earlier run's files are gone; the script removes its cache
+    # directory after.
+    self.assertFalse((self.root / "runtime_info.pb").exists())
     self.assertFalse((self.root / "benchmark_cache").exists())
     run = ddp._tflite_run(self.root / "benchmark_run.txt")
     self.assertEqual(set(run["pids"]), {"first", "measured"})
@@ -1086,8 +1138,20 @@ class TfliteRunScriptTest(absltest.TestCase):
         run["written"], {"m.xnnpack_cache": 1, "m_mldrift_program_cache.bin": 2}
     )
     self.assertEqual(run["rewritten"], [])
-    self.assertIn("first process: pid", self._record())
-    self.assertNotIn("pid 1\n", self._record())
+    self.assertIsNone(run["fallback"])
+    record = self._record()
+    self.assertIn("first process: pid", record)
+    self.assertIn(
+        "first process: command ./benchmark_model " + " ".join(self.warmup),
+        record,
+    )
+    self.assertIn(
+        "measured process: command ./benchmark_model "
+        + " ".join(self.measured),
+        record,
+    )
+    self.assertNotIn("pid 1\n", record)
+    self.assertNotIn("without the cache flags", record)
 
   def test_caches_the_measured_process_writes_again_are_recorded(self):
     (self.root / "rewrite").touch()
@@ -1099,21 +1163,81 @@ class TfliteRunScriptTest(absltest.TestCase):
         ["m.xnnpack_cache", "m_mldrift_program_cache.bin"],
     )
 
-  def test_a_failing_first_process_ends_the_job_with_its_exit_code(self):
+  def test_a_failing_first_process_runs_one_process_without_the_flags(self):
     (self.root / "fail1").touch()
     result = self._run()
-    self.assertEqual(result.returncode, 7)
-    self.assertLen(self._calls(), 1)
-    self.assertIn("first process: pid", self._record())
-    self.assertIn("the first process exited with 7\n", self._record())
-    self.assertNotIn("measured process", self._record())
+    self.assertEqual(result.returncode, 0, result.stderr)
+    first, fallback = self._calls()
+    self.assertEqual(first, self.warmup)
+    self.assertEqual(fallback, self.plain)
+    record = self._record()
+    self.assertIn("first process: exit 7\n", record)
+    self.assertIn(
+        "running once without the cache flags: the first process exited"
+        " with 7\n",
+        record,
+    )
+    self.assertIn("fallback process: pid", record)
+    self.assertIn("fallback process: exit 0\n", record)
+    self.assertNotIn("measured process", record)
+    run = ddp._tflite_run(self.root / "benchmark_run.txt")
+    self.assertEqual(set(run["pids"]), {"first", "fallback"})
+    self.assertEqual(run["fallback"], "the first process exited with 7")
+    self.assertEqual((self.root / "results.pb").read_text(), "r2")
+    self.assertFalse((self.root / "benchmark_cache").exists())
 
-  def test_a_failing_measured_process_is_the_jobs_exit_code(self):
+  def test_a_binary_that_rejects_dry_run_runs_one_process_without_it(self):
+    (self.root / "reject").touch()
+    result = self._run()
+    self.assertEqual(result.returncode, 0, result.stderr)
+    self.assertEqual(self._calls()[1], self.plain)
+    self.assertIn(
+        "running once without the cache flags: the first process exited"
+        " with 1\n",
+        self._record(),
+    )
+
+  def test_a_failing_measured_process_runs_one_process_without_the_flags(
+      self,
+  ):
+    (self.root / "fail2").touch()
+    result = self._run()
+    self.assertEqual(result.returncode, 0, result.stderr)
+    first, measured, fallback = self._calls()
+    self.assertEqual(measured, self.measured)
+    self.assertEqual(fallback, self.plain)
+    self.assertIn("measured process: exit 7\n", self._record())
+    self.assertIn(
+        "running once without the cache flags: the measured process exited"
+        " with 7\n",
+        self._record(),
+    )
+    # The failing measured process's partial result file is gone; the
+    # first process's stays.
+    self.assertEqual((self.root / "results.pb").read_text(), "r3")
+    self.assertEqual((self.root / "warmup_results.pb").read_text(), "r1")
+    self.assertFalse((self.root / "benchmark_cache").exists())
+
+  def test_a_failing_process_without_the_flags_is_the_jobs_exit_code(self):
+    (self.root / "fail1").touch()
     (self.root / "fail2").touch()
     result = self._run()
     self.assertEqual(result.returncode, 7)
     self.assertLen(self._calls(), 2)
-    self.assertIn("the measured process exited with 7\n", self._record())
+    self.assertIn("fallback process: exit 7\n", self._record())
+    self.assertIn("the fallback process exited with 7\n", self._record())
+    self.assertFalse((self.root / "benchmark_cache").exists())
+
+  def test_a_failed_measured_process_leaves_no_result_file_behind(self):
+    # The measured process fails after writing part of results.pb; the
+    # process without the flags then fails before writing anything.
+    for marker in ("fail2", "fail3", "silent3"):
+      (self.root / marker).touch()
+    result = self._run()
+    self.assertEqual(result.returncode, 7)
+    self.assertLen(self._calls(), 3)
+    self.assertFalse((self.root / "results.pb").exists())
+    self.assertEqual((self.root / "warmup_results.pb").read_text(), "r1")
 
   def test_no_binary_exits_1_before_any_process(self):
     self.fake.unlink()
@@ -1123,20 +1247,32 @@ class TfliteRunScriptTest(absltest.TestCase):
     self.assertIn("chmod ./benchmark_model failed", self._record())
 
   @absltest.skipIf(os.geteuid() == 0, "root can write a read-only directory")
-  def test_a_cache_directory_that_cannot_be_made_exits_1(self):
+  def test_a_cache_directory_that_cannot_be_made_runs_one_process(self):
     (self.root / "benchmark_run.txt").touch()
+    (self.root / "calls.txt").touch()
     self.root.chmod(0o555)
     self.addCleanup(self.root.chmod, 0o755)
-    result = self._run()
-    self.assertEqual(result.returncode, 1)
-    self.assertFalse((self.root / "calls.txt").exists())
-    self.assertIn("could not create", self._record())
+    result = subprocess.run(
+        ["sh", str(self.script), *self.args],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    self.assertEqual(result.returncode, 0, result.stderr)
+    self.assertEqual(self._calls(), [self.plain])
+    self.assertIn(
+        "running once without the cache flags: could not create"
+        f" {self.root}/benchmark_cache\n",
+        self._record(),
+    )
+    self.assertIn("fallback process: exit 0\n", self._record())
 
   def test_a_missing_cli_directory_exits_1(self):
     with mock.patch.object(
         constants, "LITERT_CLI_ANDROID_ROOT", str(self.root / "missing")
     ):
-      self.script.write_text(ddp._tflite_run_script("m.tflite", self.warmup))
+      script, _ = ddp._tflite_job("m.tflite", "gpu", self.plain)
+      self.script.write_text(script)
     result = self._run()
     self.assertEqual(result.returncode, 1)
     self.assertFalse((self.root / "calls.txt").exists())
@@ -1208,6 +1344,34 @@ class TfliteRunScriptTest(absltest.TestCase):
     self.assertIn("stopped by TERM\n", self._record())
     self.assertFalse((self.root / "benchmark_cache").exists())
 
+  def test_a_job_stopped_in_the_process_without_the_flags_stops_it_too(self):
+    (self.root / "fail1").touch()
+    (self.root / "slow2").touch()
+    script = subprocess.Popen(
+        ["sh", str(self.script), *self.args],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    pid_file = self.root / "fake.pid"
+    for _ in range(100):
+      if pid_file.exists() and pid_file.read_text().strip():
+        break
+      time.sleep(0.05)
+    fake_pid = int(pid_file.read_text())
+    script.send_signal(signal.SIGTERM)
+    self.assertEqual(script.wait(timeout=10), 143)
+    for _ in range(60):
+      try:
+        os.kill(fake_pid, 0)
+      except ProcessLookupError:
+        break
+      time.sleep(0.05)
+    else:
+      os.kill(fake_pid, signal.SIGKILL)
+      self.fail("the process without the flags kept running after TERM")
+    self.assertIn(f"fallback process: pid {fake_pid}\n", self._record())
+    self.assertIn("stopped by TERM\n", self._record())
+
   def test_a_find_that_fails_is_recorded(self):
     shims = self.root / "shims"
     shims.mkdir()
@@ -1227,11 +1391,16 @@ class TfliteRunScriptTest(absltest.TestCase):
     run = ddp._tflite_run(self.root / "benchmark_run.txt")
     self.assertIsNone(run["rewritten"])
 
-  def test_a_record_that_cannot_be_written_exits_1(self):
+  def test_a_record_that_cannot_be_written_runs_benchmark_model_once(self):
     (self.root / "benchmark_run.txt").mkdir()
     result = self._run()
-    self.assertEqual(result.returncode, 1)
-    self.assertFalse((self.root / "calls.txt").exists())
+    self.assertEqual(result.returncode, 0, result.stderr)
+    self.assertEqual(self._calls(), [self.plain])
+    self.assertEqual((self.root / "results.pb").read_text(), "r1")
+    # That process's exit code is the job's.
+    (self.root / "fail1").touch()
+    result = self._run()
+    self.assertEqual(result.returncode, 7)
 
 
 class TflitePrintTest(absltest.TestCase):
@@ -1266,6 +1435,7 @@ class TflitePrintTest(absltest.TestCase):
     self.assertIn("Model initialization: 68.77 ms", out)
     self.assertNotIn("Model initialization: 360.37 ms", out)
     self.assertNotIn("999.00", out)
+    self.assertIn("Model caches: on\n", out)
     self.assertIn(
         "First process (compiles the model and writes the caches, no"
         " inference): init 360.37 ms",
@@ -1329,8 +1499,9 @@ class TflitePrintTest(absltest.TestCase):
       )
     self.assertNotIn("97.45 ms\n09", out.getvalue())
     self.assertEqual(
-        out.getvalue().splitlines()[-4:],
+        out.getvalue().splitlines()[-5:],
         [
+            "Model caches: on",
             "First process (compiles the model and writes the caches, no"
             " inference): init 97.45 ms",
             "Caches it wrote: convnext_tiny.xnnpack_cache (115592936 B)",
@@ -1363,6 +1534,12 @@ class TflitePrintTest(absltest.TestCase):
     out = self._print(logcat, record)
     self.assertIn("Caches it wrote: m.xnnpack_cache (160 B)\n", out)
     self.assertIn(
+        "Flags this benchmark_model ignored (logged as unconsumed):"
+        " --gpu_serialization_dir=/data/local/tmp/litert-cli/benchmark_cache"
+        " --gpu_model_cache_key=m\n",
+        out,
+    )
+    self.assertIn(
         "This benchmark_model has no --gpu_serialization_dir: neither process"
         " wrote or read a GPU cache",
         out,
@@ -1383,13 +1560,48 @@ class TflitePrintTest(absltest.TestCase):
         out,
     )
 
-  def test_missing_process_lines_are_named(self):
+  def test_a_record_that_matches_no_logcat_line_prints_every_line(self):
     out = self._print(_tflite_process("3000", "999.00"), _TFLITE_RECORD)
+    self.assertIn("Model initialization: 999.00 ms", out)
     self.assertIn(
         "First process: no 'Model initialization' line in its output", out
     )
     self.assertIn("No output lines of the measured process", out)
-    self.assertNotIn("999.00", out)
+    self.assertIn(
+        "Could not tell the measured process's lines apart in the logcat;"
+        " the benchmark lines above are every process's\n",
+        out,
+    )
+
+  def test_a_process_without_the_flags_is_printed_with_its_reason(self):
+    parse_error = (
+        "ERROR: Failed to parse flag 'dry_run' against argv '--dry_run=true'"
+    )
+    logcat = (
+        _tflite_line("4000", "tflite", "STARTING!")
+        + _tflite_line("4000", "tflite", parse_error)
+        + _tflite_process("4200", "590.73")
+    )
+    record = (
+        "first process: pid 4000\nfirst process: exit 1\n"
+        "running once without the cache flags: the first process exited"
+        " with 1\n"
+        "fallback process: pid 4200\nfallback process: exit 0\n"
+    )
+    out = self._print(logcat, record)
+    self.assertIn("Model initialization: 590.73 ms", out)
+    self.assertIn(
+        "Model caches: off (the first process exited with 1): benchmark_model"
+        " ran once without the cache flags, so the results above are a cold"
+        " start with no peak memory\n",
+        out,
+    )
+    self.assertIn(
+        "The first process logged: Failed to parse flag 'dry_run' against"
+        " argv '--dry_run=true'\n",
+        out,
+    )
+    self.assertNotIn("First process (compiles", out)
 
   def test_a_failed_rewrite_check_is_named(self):
     logcat = _tflite_process("4000", "360.37") + _tflite_process(
@@ -1401,10 +1613,85 @@ class TflitePrintTest(absltest.TestCase):
     )
     self.assertNotIn("left them unchanged", out)
 
+  def test_a_process_without_the_flags_that_matches_no_line_is_named(self):
+    logcat = _tflite_process("4000", "590.73") + _tflite_process(
+        "4100", "68.77"
+    )
+    record = (
+        "first process: pid 4000\nfirst process: exit 0\n"
+        "measured process: pid 4100\nmeasured process: exit 139\n"
+        "running once without the cache flags: the measured process exited"
+        " with 139\n"
+        "fallback process: pid 4200\nfallback process: exit 0\n"
+    )
+    out = self._print(logcat, record)
+    lines = out.splitlines()
+    self.assertIn("Model initialization: 590.73 ms", out)
+    self.assertIn("Model initialization: 68.77 ms", out)
+    # The note comes before the report.
+    self.assertLess(
+        lines.index(
+            "Could not tell the fallback process's lines apart in the logcat;"
+            " the benchmark lines above are every process's"
+        ),
+        lines.index(
+            "Model caches: off (the measured process exited with 139):"
+            " benchmark_model ran once without the cache flags, so the results"
+            " above are a cold start with no peak memory"
+        ),
+    )
+
+  def test_a_fallback_pid_without_a_reason_line_still_counts(self):
+    record = (
+        "first process: pid 4000\nfirst process: exit 7\n"
+        "fallback process: pid 4200\nfallback process: exit 0\n"
+    )
+    out = self._print(_tflite_process("4200", "590.73"), record)
+    self.assertIn("Model initialization: 590.73 ms", out)
+    self.assertIn("Model caches: off (reason not recorded)", out)
+
+  def test_verbose_mode_heads_each_process(self):
+    logcat = (
+        _tflite_process("4000", "360.37")
+        + _tflite_process("4100", "68.77")
+        + _tflite_process("4200", "590.73")
+    )
+    record = (
+        _TFLITE_RECORD
+        + "running once without the cache flags: the measured process exited"
+        " with 139\n"
+        "fallback process: pid 4200\nfallback process: exit 0\n"
+    )
+    (self.dir / "logcat.txt").write_text(logcat)
+    (self.dir / "benchmark_run.txt").write_text(record)
+    out = io.StringIO()
+    with (
+        mock.patch.object(constants, "DEFAULT_QUIET", False),
+        contextlib.redirect_stdout(out),
+    ):
+      ddp._print_logcat_results(
+          self.dir / "logcat.txt", True, accelerator="gpu"
+      )
+    lines = out.getvalue().splitlines()
+    self.assertLess(
+        lines.index("First process (writes the caches, no inference):"),
+        lines.index("Measured process:"),
+    )
+    self.assertLess(
+        lines.index("Measured process:"),
+        lines.index("Process without the cache flags:"),
+    )
+    self.assertIn("Model initialization: 590.73 ms", out.getvalue())
+
   def test_without_a_record_every_benchmark_line_is_printed(self):
     out = self._print(_tflite_process("4000", "590.73"), None)
     self.assertIn("Model initialization: 590.73 ms", out)
     self.assertNotIn("First process", out)
+    self.assertIn(
+        "Model caches: no record (the job pulled no benchmark_run.txt); the"
+        " benchmark lines above are every process's\n",
+        out,
+    )
 
   def test_a_failed_job_prints_the_record_after_the_logcat_tail(self):
     record = (
