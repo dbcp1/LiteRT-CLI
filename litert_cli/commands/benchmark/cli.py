@@ -69,10 +69,8 @@ Examples:
     $ litert benchmark model.tflite --ddp --device caiman-35 --gcp-project "your-gcp-project-id"
     $ litert benchmark model.tflite --ddp --devices "caiman-35, pa3q-35" --gpu --gcp-project "your-gcp-project-id"
 \b
-  # A .litertlm bundle on DDP devices runs LiteRT-LM's benchmark binary twice: a warm-up process
-  # writes the caches beside the bundle, then the measured process runs --num-iterations times
-  # from them: prefill and decode tokens/s at --prefill-tokens / --decode-tokens, both Init
-  # times and the peak memory.
+  # A .litertlm bundle on DDP devices runs LiteRT-LM's benchmark binary: prefill and decode
+  # tokens/s at --prefill-tokens / --decode-tokens, --num-iterations times in one process.
     $ litert benchmark model.litertlm --ddp --device caiman-35 --gpu --gcp-project "your-gcp-project-id"
 """,
 )
@@ -257,9 +255,8 @@ Examples:
     type=click.IntRange(min=1),
     default=5,
     help=(
-        "Prefill and decode cycles of a .litertlm bundle's benchmark, in the"
-        " measured process after the warm-up one (For --ddp target). Default"
-        " is 5."
+        "Prefill and decode cycles of a .litertlm bundle's benchmark, in one"
+        " process (For --ddp target). Default is 5."
     ),
 )
 def benchmark_cmd(
