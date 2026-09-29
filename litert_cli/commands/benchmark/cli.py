@@ -38,10 +38,6 @@ Benchmark LiteRT models on different platforms.
 \b
 MODEL: Path to the LiteRT model file.
 \b
-With --android, --desktop and --ddp on the CPU and the GPU, benchmark_model
-runs twice: a first process writes the XNNPACK and GPU caches (no inference),
-the measured process reads them and reports the peak memory.
-\b
 Examples:
 \b
   # Benchmark on Desktop with CPU (Default) or GPU

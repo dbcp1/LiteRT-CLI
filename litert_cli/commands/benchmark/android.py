@@ -20,10 +20,8 @@ from __future__ import annotations
 import pathlib
 import shlex
 import subprocess
-import uuid
 
 import click
-from litert_cli.commands.benchmark import model_caches
 from litert_cli.core import android_utils
 from litert_cli.core import constants
 from litert_cli.core import npu_utils as npu
@@ -153,130 +151,33 @@ def run_android(
           f"ADSP_LIBRARY_PATH={quoted_dispatch_dir} "
       )
 
-    if not model_caches.uses_caches(accelerator):
-      _run_on_device(env_vars + " ".join(bench_args), show=True)
-      return
-    # A fresh directory per run: the first process always compiles the model
-    # and writes the caches, the measured process reads them.
-    cache_dir = f"{cli_android_root}/benchmark_cache_{uuid.uuid4().hex[:8]}"
-    written_mark = f"{cache_dir}.written"
-    _adb_shell(f"mkdir -p {shlex.quote(cache_dir)}")
-    try:
-      bench_args += [
-          shlex.quote(arg)
-          for arg in model_caches.cache_args(
-              accelerator, cache_dir, model_name
-          )
-      ]
-      click.echo("Writing the model caches (benchmark_model, no inference)...")
-      first = _run_on_device(
-          env_vars + " ".join(bench_args + list(model_caches.WARMUP_ARGS)),
-          show=not constants.DEFAULT_QUIET,
+    full_command = env_vars + " ".join(bench_args)
+    process = subprocess.Popen(
+        ["adb", "shell", full_command],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+
+    from litert_cli.core.log_filters import BenchmarkLogFilter
+
+    output_lines = []
+    log_filter = BenchmarkLogFilter(constants.DEFAULT_QUIET)
+
+    for line in process.stdout:
+      output_lines.append(line)
+      if log_filter.should_show(line):
+        click.echo(line, nl=False)
+
+    process.wait()
+    if process.returncode != 0:
+      click.secho(
+          f"Execution failed on device with exit code {process.returncode}",
+          fg="red",
       )
-      written = {}
-      for line in _adb_shell(
-          f"cd {shlex.quote(cache_dir)} && wc -c * 2>/dev/null;"
-          f" touch {shlex.quote(written_mark)}"
-      ).splitlines():
-        size, _, name = line.strip().partition(" ")
-        if size.isdigit() and name and name != "total":
-          written[name] = int(size)
-      measured = _run_on_device(
-          env_vars
-          + " ".join(bench_args + [model_caches.PEAK_MEMORY_ARG]),
-          show=True,
-      )
-      found = subprocess.run(
-          [
-              "adb",
-              "shell",
-              f"find {shlex.quote(cache_dir)} -type f"
-              f" -newer {shlex.quote(written_mark)}",
-          ],
-          stdout=subprocess.PIPE,
-          stderr=subprocess.DEVNULL,
-          text=True,
-          check=False,
-      )
-      rewritten = (
-          [
-              line.strip().rsplit("/", 1)[-1]
-              for line in found.stdout.splitlines()
-              if line.strip()
-          ]
-          if found.returncode == 0
-          else None
-      )
-    finally:
-      subprocess.run(
-          [
-              "adb",
-              "shell",
-              f"rm -rf {shlex.quote(cache_dir)} {shlex.quote(written_mark)}",
-          ],
-          check=False,
-      )
-    for line in model_caches.report(
-        accelerator, first, measured, written, rewritten
-    ):
-      click.secho(line, fg="green")
-  except click.ClickException:
-    raise
+      click.echo("Full output for debugging:")
+      for line in output_lines:
+        click.echo(line, nl=False)
+      raise click.ClickException("Benchmark failed on device.")
   except Exception as e:
     raise click.ClickException(f"Failed to execute benchmark on device: {e}")
-
-
-def _adb_shell(command: str) -> str:
-  """Runs a shell command on the device and returns its output.
-
-  Raises click.ClickException with the output when it exits non-zero.
-  """
-  result = subprocess.run(
-      ["adb", "shell", command],
-      stdout=subprocess.PIPE,
-      stderr=subprocess.STDOUT,
-      text=True,
-      check=False,
-  )
-  if result.returncode != 0:
-    raise click.ClickException(
-        f"'adb shell {command}' failed with exit code {result.returncode}:\n"
-        f"{result.stdout}"
-    )
-  return result.stdout
-
-
-def _run_on_device(full_command: str, *, show: bool) -> list[str]:
-  """Runs benchmark_model on the device and returns its output lines.
-
-  With `show`, prints the lines the benchmark log filter keeps. Prints the
-  whole output and raises click.ClickException when the binary exits non-zero.
-  """
-  process = subprocess.Popen(
-      ["adb", "shell", full_command],
-      stdout=subprocess.PIPE,
-      stderr=subprocess.STDOUT,
-      text=True,
-  )
-
-  from litert_cli.core.log_filters import BenchmarkLogFilter
-
-  output_lines = []
-  log_filter = BenchmarkLogFilter(constants.DEFAULT_QUIET)
-
-  for line in process.stdout:
-    output_lines.append(line)
-    if show and log_filter.should_show(line):
-      click.echo(line, nl=False)
-
-  process.wait()
-  if process.returncode != 0:
-    click.secho(
-        f"Execution failed on device with exit code {process.returncode}",
-        fg="red",
-    )
-    click.echo("Full output for debugging:")
-    for line in output_lines:
-      click.echo(line, nl=False)
-    raise click.ClickException("Benchmark failed on device.")
-  return output_lines
