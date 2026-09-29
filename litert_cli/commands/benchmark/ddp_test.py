@@ -82,16 +82,50 @@ _LM_LIBS = [
 ]
 
 
-def _lm_block(ttft: str, prefill: str, decode: str) -> str:
-  """One BenchmarkInfo block as LiteRT-LM's binary logs it (logcat form)."""
-  prefix = "09-19 11:22:12.427  8446  8446 I native  : "
-  return (
-      f"{prefix}I0000 00:00:1789784532.427623    8446 litert_lm_lib.cc:424]"
+def _lm_block(
+    ttft: str,
+    prefill: str,
+    decode: str,
+    *,
+    pid: str = "8446",
+    init: str = "2811.82",
+    peak: str | None = None,
+) -> str:
+  """One BenchmarkInfo block as LiteRT-LM's binary logs it (logcat form).
+
+  With `peak`, the peak memory lines of --report_peak_memory_footprint follow
+  the block, as the binary logs them after each iteration.
+  """
+  prefix = f"09-19 11:22:12.427  {pid}  {pid} I native  : "
+  block = (
+      f"{prefix}I0000 00:00:1789784532.427623    {pid} litert_lm_lib.cc:424]"
       " BenchmarkInfo:\n"
-      f"{prefix}    - Init Total: 2811.82 ms\n"
+      f"{prefix}    - Init Total: {init} ms\n"
       f"{prefix}  Time to first token: {ttft} s\n"
       f"{prefix}      Prefill Speed: {prefill} tokens/sec.\n"
       f"{prefix}      Decode Speed: {decode} tokens/sec.\n"
+  )
+  if peak is not None:
+    block += (
+        f"{prefix}I0000 00:00:1789784533.000000    {pid} litert_lm_lib.cc:474]"
+        f" Peak system ram usage: {peak}MB.\n"
+        f"{prefix}I0000 00:00:1789784533.000000    {pid} litert_lm_lib.cc:475]"
+        " Memory usage: max resident set size/physical footprint = 1.00 MB\n"
+        f"{prefix}I0000 00:00:1789784533.000000    {pid} litert_lm_lib.cc:477]"
+        f" Peak private footprint: {peak}MB.\n"
+    )
+  return block
+
+
+def _lm_aggregated(pid: str, iterations: int) -> str:
+  return (
+      f"09-19 11:22:13.000  {pid}  {pid} I native  : I0000 00:00:1789784533.0"
+      f"    {pid} litert_lm_lib.cc:537] Aggregated BenchmarkInfo (median of"
+      f" {iterations} iterations):\n"
+      f"09-19 11:22:13.000  {pid}  {pid} I native  :       Prefill Speed:"
+      " 999.00 tokens/sec.\n"
+      f"09-19 11:22:13.000  {pid}  {pid} I native  :       Decode Speed:"
+      " 999.00 tokens/sec.\n"
   )
 
 
@@ -103,13 +137,20 @@ _LM_LOGCAT = (
     + _lm_block("0.16", "491.23", "32.09")
     + _lm_block("0.14", "516.38", "65.98")
     + _lm_block("0.12", "500.00", "60.00")
-    + "09-19 11:22:13.000  8446  8446 I native  : I0000 00:00:1789784533.0"
-    "    8446 litert_lm_lib.cc:537] Aggregated BenchmarkInfo (median of 3"
-    " iterations):\n"
-    "09-19 11:22:13.000  8446  8446 I native  :       Prefill Speed: 999.00"
-    " tokens/sec.\n"
-    "09-19 11:22:13.000  8446  8446 I native  :       Decode Speed: 999.00"
-    " tokens/sec.\n"
+    + _lm_aggregated("8446", 3)
+)
+# The run script's two processes: the warm-up process (one iteration, the cold
+# Init) and the measured one, both with the peak memory lines.
+_LM_LOGCAT_TWO_PROCESSES = (
+    "09-19 11:22:08.986  8400  8400 I litert  : [gpu_registry.cc:135]"
+    " Dynamically loaded GPU accelerator(libLiteRtOpenClAccelerator.so)"
+    " registered.\n"
+    + _lm_block("0.20", "480.00", "30.00", pid="8400", peak="1643.35")
+    + _lm_aggregated("8400", 1)
+    + _lm_block("0.16", "491.23", "32.09", init="900.50", peak="1500.10")
+    + _lm_block("0.14", "516.38", "65.98", init="900.50", peak="1568.53")
+    + _lm_block("0.12", "500.00", "60.00", init="900.50", peak="1568.74")
+    + _lm_aggregated("8446", 3)
 )
 
 
@@ -923,6 +964,7 @@ class LmHelpersTest(absltest.TestCase):
             "--benchmark_decode_tokens=256",
             "--max_num_tokens=1280",
             "--num_iterations=5",
+            "--report_peak_memory_footprint=true",
             f"--metric_proto_file_path={_ROOT}/metrics.pb",
         ],
     )
@@ -932,11 +974,121 @@ class LmHelpersTest(absltest.TestCase):
     self.assertTrue(script.startswith("#!/system/bin/sh\n"))
     self.assertIn(f'ROOT="{_ROOT}"', script)
     self.assertIn(
-        'LD_LIBRARY_PATH="$ROOT" exec ./litert_lm_advanced_main "$@"', script
+        'CACHES="./*.xnnpack_cache* ./*_mldrift_*cache*.bin ./*.mtp_drafter*"',
+        script,
     )
-    self.assertIn("rm -f ./*.xnnpack_cache* ./*_mldrift_*cache*.bin", script)
+    self.assertIn("rm -f $CACHES\n", script)
     self.assertIn("> provenance.txt", script)
     self.assertIn("chmod 755 litert_lm_advanced_main || exit 1", script)
+    self.assertIn('[ -f "$MODEL" ] && touch "$MODEL"\n', script)
+    # The warm-up process, then the measured one with the arguments unchanged.
+    warmup = script.index(
+        'LD_LIBRARY_PATH="$ROOT" ./litert_lm_advanced_main "$@"'
+        " --num_iterations=1 --metric_proto_file_path=\n"
+    )
+    self.assertIn('[ "$rc" -eq 0 ] || exit "$rc"', script)
+    measured = script.index(
+        'LD_LIBRARY_PATH="$ROOT" ./litert_lm_advanced_main "$@"\n'
+    )
+    self.assertLess(warmup, measured)
+    self.assertTrue(script.endswith('exit "$rc"\n'))
+
+  @absltest.skipIf(shutil.which("sh") is None, "needs a POSIX shell")
+  def test_lm_run_script_runs_a_warmup_process_then_the_measured_one(self):
+    """The rendered script on a POSIX sh with a fake binary that logs its calls.
+
+    The device-only commands of the provenance block (getprop, stat -c,
+    sha256sum) fail quietly inside it; the control flow under test is the same.
+    """
+    root = pathlib.Path(tempfile.mkdtemp())
+    self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+    fake = root / ddp._LM_BINARY
+    calls = root / f"{ddp._LM_BINARY}.calls"
+    # Logs its arguments; exits 7 on call N when <binary>.failN exists; writes
+    # a cache file unless <binary>.nocache exists.
+    fake.write_text(
+        "#!/bin/sh\n"
+        'printf "%s\\n" "$@" >> "$0.calls"\n'
+        'printf "%s\\n" -- >> "$0.calls"\n'
+        'n=$(grep -c -- "^--$" "$0.calls")\n'
+        '[ -f "$0.fail$n" ] && exit 7\n'
+        '[ -f "$0.nocache" ] || touch ./m.litertlm_1_2.xnnpack_cache\n'
+        "exit 0\n"
+    )
+    (root / "m.litertlm").write_bytes(b"\0")
+    with mock.patch.object(constants, "LITERT_CLI_ANDROID_ROOT", str(root)):
+      script = root / ddp._LM_RUN_SCRIPT_NAME
+      script.write_text(ddp._lm_run_script())
+    args = [
+        "--backend=cpu",
+        f"--model_path={root}/m.litertlm",
+        "--num_iterations=5",
+        f"--metric_proto_file_path={root}/metrics.pb",
+    ]
+
+    def run() -> subprocess.CompletedProcess[str]:
+      if calls.exists():
+        calls.unlink()
+      return subprocess.run(
+          ["sh", str(script), *args],
+          capture_output=True,
+          text=True,
+          check=False,
+      )
+
+    def provenance() -> str:
+      return (root / ddp._LM_PROVENANCE_FILE).read_text()
+
+    # Both processes run: the warm-up one with the two extra flags, the
+    # measured one with the arguments unchanged; both exit codes recorded.
+    result = run()
+    self.assertEqual(result.returncode, 0, result.stderr)
+    self.assertEqual(
+        calls.read_text().split("--\n"),
+        [
+            "\n".join(
+                args + ["--num_iterations=1", "--metric_proto_file_path="]
+            )
+            + "\n",
+            "\n".join(args) + "\n",
+            "",
+        ],
+    )
+    self.assertIn(f"args: {' '.join(args)}\n", provenance())
+    self.assertRegex(
+        provenance(),
+        r"warm-up process: exit 0\ncaches after the warm-up process:\n"
+        r".*m.litertlm_1_2.xnnpack_cache\n"
+        r"measured process: exit 0\ncaches after the measured process:\n"
+        r".*m.litertlm_1_2.xnnpack_cache\n$",
+    )
+    # A failing warm-up process ends the job with its exit code, unmeasured.
+    (root / f"{ddp._LM_BINARY}.fail1").touch()
+    result = run()
+    self.assertEqual(result.returncode, 7, result.stderr)
+    self.assertEqual(calls.read_text().count("--\n"), 1)
+    self.assertIn("warm-up process: exit 7\n", provenance())
+    self.assertNotIn("measured process", provenance())
+    (root / f"{ddp._LM_BINARY}.fail1").unlink()
+    # A failing measured process is the job's exit code too.
+    (root / f"{ddp._LM_BINARY}.fail2").touch()
+    result = run()
+    self.assertEqual(result.returncode, 7, result.stderr)
+    self.assertEqual(calls.read_text().count("--\n"), 2)
+    self.assertIn("measured process: exit 7\n", provenance())
+    (root / f"{ddp._LM_BINARY}.fail2").unlink()
+    # A warm-up process that wrote no cache is visible in provenance.txt.
+    (root / f"{ddp._LM_BINARY}.nocache").touch()
+    for cache in root.glob("*.xnnpack_cache"):
+      cache.unlink()
+    result = run()
+    self.assertEqual(result.returncode, 0, result.stderr)
+    self.assertIn("caches after the warm-up process:\n  (none)\n", provenance())
+    # No binary: chmod fails, exit 1 before any process.
+    fake.unlink()
+    result = run()
+    self.assertEqual(result.returncode, 1, result.stderr)
+    self.assertFalse(calls.exists())
 
   def test_build_session_request_for_a_bundle(self):
     pushes = [
@@ -986,7 +1138,7 @@ class LmHelpersTest(absltest.TestCase):
 
   def test_lm_summary_leaves_out_the_warmup_iterations(self):
     lines = _LM_LOGCAT.splitlines()
-    self.assertLen(ddp._lm_iterations(lines), 3)
+    self.assertEqual([len(p) for p in ddp._lm_processes(lines)], [3])
     self.assertEqual(
         ddp._lm_summary(lines, 1),
         [
@@ -1006,6 +1158,59 @@ class LmHelpersTest(absltest.TestCase):
     self.assertEqual(ddp._lm_summary(lines, 3), [])
     self.assertEqual(ddp._lm_summary(_LOGCAT.splitlines(), 1), [])
 
+  def test_lm_summary_reads_the_measured_process_after_the_warmup_one(self):
+    lines = _LM_LOGCAT_TWO_PROCESSES.splitlines()
+    processes = ddp._lm_processes(lines)
+    self.assertEqual([len(p) for p in processes], [1, 3])
+    self.assertEqual(processes[0][0]["init_ms"], 2811.82)
+    self.assertEqual(processes[0][0]["peak_mem_mb"], 1643.35)
+    self.assertEqual(processes[1][0]["init_ms"], 900.5)
+    self.assertEqual(processes[1][2]["peak_mem_mb"], 1568.74)
+    summary = [
+        (
+            "LiteRT-LM benchmark: second process, 3 iteration(s), 1 warm-up;"
+            " median of the other 2:"
+        ),
+        (
+            "  prefill 508.2 tokens/s, decode 63.0 tokens/s, time to first"
+            " token 0.13 s; init 900 ms (cold 2812 ms in the first process);"
+            " peak memory 1569 MB (RSS)"
+        ),
+    ]
+    self.assertEqual(ddp._lm_summary(lines, 1), summary)
+    self.assertEqual(ddp._lm_summary(lines, 3), [])
+    # A stray block from an earlier process: the last two processes count.
+    stray = _lm_block("0.50", "100.00", "10.00", pid="100", init="5000.00")
+    self.assertEqual(
+        ddp._lm_summary((stray + _LM_LOGCAT_TWO_PROCESSES).splitlines(), 1),
+        summary,
+    )
+    # Blocks without a logcat prefix are one process.
+    bare = [l.split(" : ", 1)[-1] for l in lines]
+    self.assertEqual([len(p) for p in ddp._lm_processes(bare)], [4])
+    self.assertIn("4 iteration(s), 1 warm-up", ddp._lm_summary(bare, 1)[0])
+
+  def test_lm_summary_without_a_cold_init_or_peak_lines(self):
+    # The warm-up process's block lacks an Init line.
+    lines = (
+        _lm_block("0.20", "480.00", "30.00", pid="8400", init="")
+        + _lm_block("0.16", "491.23", "32.09", init="900.50")
+        + _lm_block("0.14", "516.38", "65.98", init="900.50")
+    ).splitlines()
+    self.assertEqual(
+        ddp._lm_summary(lines, 1),
+        [
+            (
+                "LiteRT-LM benchmark: second process, 2 iteration(s), 1"
+                " warm-up; median of the other 1:"
+            ),
+            (
+                "  prefill 516.4 tokens/s, decode 66.0 tokens/s, time to first"
+                " token 0.14 s; init 900 ms"
+            ),
+        ],
+    )
+
   def test_lm_log_filter_keeps_the_benchmark_lines(self):
     from litert_cli.core.log_filters import LmBenchmarkLogFilter
 
@@ -1018,6 +1223,28 @@ class LmHelpersTest(absltest.TestCase):
     )
     self.assertTrue(any("gpu_registry.cc" in l for l in shown))
     self.assertFalse(any("noise line" in l for l in shown))
+    shown = [
+        l
+        for l in _LM_LOGCAT_TWO_PROCESSES.splitlines()
+        if log_filter.should_show(l)
+    ]
+    self.assertTrue(
+        any("Peak system ram usage: 1568.74MB." in l for l in shown)
+    )
+    self.assertTrue(
+        log_filter.should_show(
+            "09-28 15:14:22.295  3484  3484 I tflite  : XNNPack weight cache"
+            " loaded from '/data/local/tmp/litert-cli/m.litertlm_1_2"
+            ".xnnpack_cache'."
+        )
+    )
+    self.assertTrue(
+        log_filter.should_show(
+            "09-28 15:23:36.118  9750  9750 I native  : I0000 00:00:1790576616"
+            ".118 9750 inference_context.cc:2097] Initialized InferenceContext"
+            " from serialized data."
+        )
+    )
     self.assertTrue(
         LmBenchmarkLogFilter(default_quiet=False).should_show("noise line")
     )
@@ -1078,6 +1305,7 @@ class LmRunDdpTest(absltest.TestCase):
         ],
     )
     self.assertIn("--num_iterations=5", binary["args"])
+    self.assertIn("--report_peak_memory_footprint=true", binary["args"])
     push = job["allocationConfig"]["deviceConfigs"][0]["actions"][0]
     self.assertLen(push["androidPushFiles"]["fileConfigs"], 2 + len(_LM_LIBS))
     self.assertIn(
