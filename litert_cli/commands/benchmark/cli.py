@@ -38,6 +38,13 @@ Benchmark LiteRT models on different platforms.
 \b
 MODEL: Path to the LiteRT model file.
 \b
+With --android, --desktop and --ddp on the CPU and the GPU, benchmark_model
+runs twice: a first process writes the XNNPACK and GPU caches (no inference),
+the measured process reads them and reports the peak memory. If a process
+with the cache flags fails, benchmark_model runs once without them, as
+before, and the report says so; LITERT_DISABLE_MODEL_CACHES=1 runs it once
+from the start.
+\b
 Examples:
 \b
   # Benchmark on Desktop with CPU (Default) or GPU
@@ -169,8 +176,11 @@ Examples:
     type=click.IntRange(min=1),
     help=(
         "Seconds to wait for the benchmark session to finish (For --ddp"
-        " target). Default is --max-secs times the number of devices, plus"
-        " 600."
+        " target). Default is the job's execution timeout times the number"
+        " of devices, plus 600: for a .tflite model, twice --max-secs plus"
+        " 120 s, clamped to 300-3600 s (with LITERT_DISABLE_MODEL_CACHES=1"
+        " the job has no timeout of its own and --max-secs stands in); for a"
+        " .litertlm bundle, 1800 s."
     ),
 )
 @click.option(

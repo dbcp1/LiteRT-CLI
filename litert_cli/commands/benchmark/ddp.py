@@ -22,6 +22,7 @@ import json
 import os
 import pathlib
 import re
+import shlex
 import statistics
 import subprocess
 import tempfile
@@ -32,6 +33,7 @@ import urllib.request
 import uuid
 
 import click
+from litert_cli.commands.benchmark import model_caches
 from litert_cli.core import constants
 from litert_cli.core.log_filters import BenchmarkLogFilter
 from litert_cli.core.log_filters import LmBenchmarkLogFilter
@@ -50,6 +52,113 @@ _GCS_SESSIONS_PREFIX = "litert-cli/sessions"
 _RESULT_FILE = "results.pb"
 _RUNTIME_INFO_FILE = "runtime_info.pb"
 _RESULT_FILES = (_RESULT_FILE, _RUNTIME_INFO_FILE)
+# A .tflite model's job runs benchmark_model through this script (see
+# model_caches): a first process writes the model caches into _TFLITE_CACHE and
+# its result file into _WARMUP_RESULT_FILE, then the measured process reads
+# the caches and writes results.pb and runtime_info.pb. The job's arguments
+# are benchmark_model's plain arguments, as before the caches; the script adds
+# the cache flags and the peak memory report to the measured process. When
+# the cache directory cannot be made or one of the two processes exits
+# non-zero, the script runs benchmark_model once with the plain arguments,
+# and that process's exit code is the job's. The script records each
+# process's command, pid and exit code, the cache files the first process
+# wrote and the ones the measured process wrote again in _TFLITE_RUN_FILE;
+# when it cannot write that record it runs benchmark_model once, as before.
+# Before a non-zero exit of its own it logs the reason and removes the caches;
+# a TERM, INT or HUP also stops the running benchmark_model, while a KILL
+# leaves both behind.
+_TFLITE_BINARY = "benchmark_model"
+_TFLITE_RUN_SCRIPT_NAME = "benchmark_model_run.sh"
+_TFLITE_CACHE = "benchmark_cache"
+_TFLITE_RUN_FILE = "benchmark_run.txt"
+_WARMUP_RESULT_FILE = "warmup_results.pb"
+_TFLITE_RESULT_FILES = _RESULT_FILES + (_WARMUP_RESULT_FILE, _TFLITE_RUN_FILE)
+# The device stops a .tflite job after this long: the measured process and,
+# after a failure, the process without the cache flags may each run for
+# --max-secs, plus the model loads. Never less than the platform's default of
+# 5 minutes, which a job without a timeout gets; the platform allows up to
+# 60 minutes.
+_TFLITE_EXECUTION_TIMEOUT_SLACK_SECS = 120
+_TFLITE_EXECUTION_TIMEOUT_MIN_SECS = 300
+_EXECUTION_TIMEOUT_MAX_SECS = 3600
+_TFLITE_RUN_SCRIPT = """#!/system/bin/sh
+ROOT="{root}"
+CACHE="$ROOT/{cache}"
+RUN="$ROOT/{run_file}"
+MARK="$ROOT/.{cache}_written"
+pid=""
+note() {{
+  echo "$1" >> "$RUN"
+  log -t litert-cli "$1" 2>/dev/null
+}}
+stop() {{
+  rm -rf "$CACHE" "$MARK"
+  note "$1"
+  exit "$2"
+}}
+on_signal() {{
+  [ -n "$pid" ] && kill "$pid" 2>/dev/null
+  stop "stopped by $1" "$2"
+}}
+# run <label> <argument>...: runs benchmark_model with the arguments and
+# records its command, pid and exit code; returns the exit code.
+run() {{
+  label="$1"
+  shift
+  echo "$label process: command ./{binary} $*" >> "$RUN"
+  ./{binary} "$@" &
+  pid=$!
+  echo "$label process: pid $pid" >> "$RUN"
+  wait "$pid"
+  rc=$?
+  pid=""
+  echo "$label process: exit $rc" >> "$RUN"
+  return "$rc"
+}}
+trap 'on_signal TERM 143' TERM
+trap 'on_signal INT 130' INT
+trap 'on_signal HUP 129' HUP
+cd "$ROOT" || exit 1
+rm -f {output_files}
+# Without the record there is no report: run benchmark_model once, as before.
+true > "$RUN" 2>/dev/null || {{ chmod 755 ./{binary}; exec ./{binary} "$@"; }}
+sha256sum ./{binary} {model} >> "$RUN" 2>&1
+chmod 755 ./{binary} || stop "chmod ./{binary} failed" 1
+if ! {{ rm -rf "$CACHE" "$MARK" && mkdir "$CACHE"; }}; then
+  why="could not create $CACHE"
+elif ! run first {warmup_args}; then
+  why="the first process exited with $rc"
+else
+  touch "$MARK"
+  echo "caches the first process wrote:" >> "$RUN"
+  wc -c "$CACHE"/* >> "$RUN" 2>/dev/null
+  if run measured "$@" {measured_args}; then
+    echo "caches the measured process wrote again:" >> "$RUN"
+    find "$CACHE" -type f -newer "$MARK" >> "$RUN" ||
+      echo "(find failed)" >> "$RUN"
+    rm -rf "$CACHE" "$MARK"
+    exit 0
+  fi
+  why="the measured process exited with $rc"
+fi
+# The results do not depend on the caches: run benchmark_model once without
+# their flags, as before, and let that process's exit code be the job's.
+rm -rf "$CACHE" "$MARK"
+rm -f {result_files}
+note "running once without the cache flags: $why"
+run fallback "$@" || stop "the fallback process exited with $rc" "$rc"
+"""
+_TFLITE_RUN_LINE = re.compile(
+    r"^(first|measured|fallback) process: (command|pid|exit) (.*)$"
+)
+_TFLITE_RUN_FALLBACK = "running once without the cache flags: "
+# What the CLI says when a .tflite job with the caches on left no record.
+_NO_RECORD_LINE = (
+    f"Model caches: no record (the job pulled no {_TFLITE_RUN_FILE}); the"
+    " benchmark lines above are every process's"
+)
+# The process id of a logcat line ("MM-DD HH:MM:SS.mmm PID TID L TAG : ...").
+_LOGCAT_PID = re.compile(r"^\d\d-\d\d \d\d:\d\d:\d\d\.\d+\s+(\d+)\s+\d+\s")
 # A .litertlm bundle runs LiteRT-LM's prebuilt benchmark binary instead of
 # benchmark_model. The binaries are published under
 # gs://litert/binaries/<version>/android_arm64/litert_lm/; `latest` is the only
@@ -106,7 +215,8 @@ _LM_METRIC_PATTERNS = {
 _POLL_INTERVAL_SECS = 15
 # Socket timeout of one Device Run API request.
 _HTTP_TIMEOUT_SECS = 60
-# Added to max_secs x number of devices to get the default --timeout.
+# Added to the job's execution timeout x number of devices to get the default
+# --timeout.
 _POLL_TIMEOUT_SLACK_SECS = 600
 # Consecutive poll errors after which the CLI stops waiting.
 _MAX_POLL_FAILURES = 5
@@ -173,6 +283,69 @@ def _lm_run_script() -> str:
       root=constants.LITERT_CLI_ANDROID_ROOT,
       binary=_LM_BINARY,
       provenance=_LM_PROVENANCE_FILE,
+  )
+
+
+def _tflite_warmup_args(
+    bench_args: list[str], cache_flags: list[str]
+) -> list[str]:
+  """The first process's arguments, from the job's plain arguments.
+
+  The same model and accelerator, the cache flags, no inference, its own
+  result file, no runtime info file and no peak memory report.
+  """
+  root = constants.LITERT_CLI_ANDROID_ROOT
+  measured_only = ("--result_file_path=", "--model_runtime_info_output_file=")
+  return (
+      [arg for arg in bench_args if not arg.startswith(measured_only)]
+      + cache_flags
+      + [
+          *model_caches.WARMUP_ARGS,
+          f"--result_file_path={root}/{_WARMUP_RESULT_FILE}",
+      ]
+  )
+
+
+def _tflite_job(
+    model_name: str, accelerator: str, bench_args: list[str]
+) -> tuple[str, list[str]]:
+  """The run script of a .tflite job, and the job's arguments.
+
+  The job's arguments are `bench_args`, benchmark_model's plain arguments;
+  the script carries the first process's arguments and the flags it adds to
+  the measured process, and falls back to the plain arguments.
+  """
+  root = constants.LITERT_CLI_ANDROID_ROOT
+  cache_flags = model_caches.cache_args(
+      accelerator, f"{root}/{_TFLITE_CACHE}", model_name
+  )
+  script = _TFLITE_RUN_SCRIPT.format(
+      root=root,
+      cache=_TFLITE_CACHE,
+      run_file=_TFLITE_RUN_FILE,
+      binary=_TFLITE_BINARY,
+      model=shlex.quote(f"./{model_name}"),
+      output_files=_quoted(_RESULT_FILES + (_WARMUP_RESULT_FILE,)),
+      result_files=_quoted(_RESULT_FILES),
+      warmup_args=_quoted(_tflite_warmup_args(bench_args, cache_flags)),
+      measured_args=_quoted(cache_flags + [model_caches.PEAK_MEMORY_ARG]),
+  )
+  return script, list(bench_args)
+
+
+def _quoted(args) -> str:
+  """The arguments quoted for the device shell, space-separated."""
+  return " ".join(shlex.quote(arg) for arg in args)
+
+
+def _tflite_execution_timeout_secs(max_secs: float) -> int:
+  """Seconds after which the device stops a .tflite job's script."""
+  return min(
+      _EXECUTION_TIMEOUT_MAX_SECS,
+      max(
+          _TFLITE_EXECUTION_TIMEOUT_MIN_SECS,
+          int(2 * max_secs) + _TFLITE_EXECUTION_TIMEOUT_SLACK_SECS,
+      ),
   )
 
 
@@ -392,6 +565,7 @@ def _build_session_request(
     result_files: tuple[str, ...] = _RESULT_FILES,
     execution_timeout_secs: int | None = None,
     runtime: str | None = None,
+    extra_labels: dict[str, str] | None = None,
 ) -> dict[str, Any]:
   """Builds the Device Run session request: one job per device.
 
@@ -409,6 +583,7 @@ def _build_session_request(
     execution_timeout_secs: Seconds after which the device stops the job; None
       leaves the platform's default.
     runtime: A runtime label for the job, when not benchmark_model.
+    extra_labels: More labels for the job.
   """
   root = constants.LITERT_CLI_ANDROID_ROOT
   pushes = [(model_gcs_path, model_name)] + list(extra_pushes or [])
@@ -425,6 +600,7 @@ def _build_session_request(
   }
   if runtime:
     labels["runtime"] = runtime
+  labels.update(extra_labels or {})
   job_configs = []
   for device_id in device_list:
     job_configs.append({
@@ -597,36 +773,140 @@ def _lm_summary(lines: list[str], warmup_iterations: int) -> list[str]:
   return summary
 
 
+def _tflite_run(path: pathlib.Path) -> dict[str, Any]:
+  """Reads the run script's record: pids, cache files, and the fallback.
+
+  Returns {"pids": {"first": pid, "measured": pid, "fallback": pid},
+  "written": {name: size}, "rewritten": [name, ...], "fallback": reason};
+  the cache file names are without the directory, "rewritten" is None when
+  the script could not check, and "fallback" is None when the measured
+  process's results stand.
+  """
+  run: dict[str, Any] = {
+      "pids": {},
+      "written": {},
+      "rewritten": [],
+      "fallback": None,
+  }
+  section = None
+  for line in path.read_text(errors="replace").splitlines():
+    if match := _TFLITE_RUN_LINE.match(line):
+      if match.group(2) == "pid":
+        run["pids"][match.group(1)] = match.group(3)
+      section = None
+    elif line.startswith(_TFLITE_RUN_FALLBACK):
+      run["fallback"] = line[len(_TFLITE_RUN_FALLBACK) :]
+      section = None
+    elif line == "caches the first process wrote:":
+      section = "written"
+    elif line == "caches the measured process wrote again:":
+      section = "rewritten"
+    elif section == "written" and line.strip():
+      size, _, file = line.strip().partition(" ")
+      if file.strip() != "total" and size.isdigit():
+        run["written"][file.strip().rsplit("/", 1)[-1]] = int(size)
+    elif section == "rewritten" and line.startswith("/"):
+      if run["rewritten"] is not None:
+        run["rewritten"].append(line.strip().rsplit("/", 1)[-1])
+    elif section == "rewritten" and line.strip() == "(find failed)":
+      run["rewritten"] = None
+  if "fallback" in run["pids"] and run["fallback"] is None:
+    run["fallback"] = "reason not recorded"
+  return run
+
+
+def _process_lines(lines: list[str], pid: str | None) -> list[str]:
+  """The logcat lines of one process."""
+  return [
+      line
+      for line in lines
+      if (match := _LOGCAT_PID.match(line)) and match.group(1) == pid
+  ]
+
+
 def _print_logcat_results(
     logcat_path: pathlib.Path,
     passed: bool,
     *,
     lm: bool = False,
     warmup_iterations: int = 0,
+    accelerator: str = "cpu",
+    caches: bool = True,
 ) -> None:
   """Prints the benchmark lines of a logcat, or its tail when the job failed.
 
   For a LiteRT-LM run (`lm`), the benchmark lines are the binary's
   BenchmarkInfo blocks, followed by the medians over the iterations after the
-  first `warmup_iterations`.
+  first `warmup_iterations`. For a .tflite model whose job left the run
+  script's record, they are the measured process's, or the lines of the
+  process that ran without the cache flags after a failure, followed by the
+  model caches report; when the record's pids match no logcat line, every
+  process's lines are printed and a line says so. `caches` is whether the
+  job ran the script at all.
   """
   lines = logcat_path.read_text(errors="replace").splitlines()
-  if passed:
-    log_filter = (
-        LmBenchmarkLogFilter(constants.DEFAULT_QUIET)
-        if lm
-        else BenchmarkLogFilter(constants.DEFAULT_QUIET)
-    )
-    for line in lines:
-      if log_filter.should_show(line):
-        click.echo(line)
-    if lm:
-      for line in _lm_summary(lines, warmup_iterations):
-        click.secho(line, fg="green")
-  else:
+  run_path = logcat_path.parent / _TFLITE_RUN_FILE
+  run = _tflite_run(run_path) if not lm and run_path.exists() else None
+  if not passed:
     click.echo(f"Last {_LOGCAT_TAIL_LINES} lines of {logcat_path.name}:")
     for line in lines[-_LOGCAT_TAIL_LINES:]:
       click.echo(line)
+    if run is not None:
+      click.echo(f"{_TFLITE_RUN_FILE}:")
+      click.echo(run_path.read_text(errors="replace").rstrip())
+    return
+  log_filter = (
+      LmBenchmarkLogFilter(constants.DEFAULT_QUIET)
+      if lm
+      else BenchmarkLogFilter(constants.DEFAULT_QUIET)
+  )
+  notes = []
+  if run is not None:
+    processes = {
+        label: _process_lines(lines, run["pids"].get(label))
+        for label in ("first", "measured", "fallback")
+    }
+    shown = "fallback" if run["fallback"] is not None else "measured"
+    if not processes[shown]:
+      # The record's pids match no line (a process that logged nothing, or
+      # another logcat format): show every process's lines.
+      notes.append(
+          f"Could not tell the {shown} process's lines apart in the logcat;"
+          " the benchmark lines above are every process's"
+      )
+    elif constants.DEFAULT_QUIET:
+      lines = processes[shown]
+    else:
+      lines = []
+      for label, heading in (
+          ("first", "First process (writes the caches, no inference):"),
+          ("measured", "Measured process:"),
+          ("fallback", "Process without the cache flags:"),
+      ):
+        if processes[label]:
+          lines += [heading] + processes[label]
+  elif not lm and not caches:
+    notes.append(model_caches.DISABLED_LINE)
+  elif not lm:
+    notes.append(_NO_RECORD_LINE)
+  for line in lines:
+    if log_filter.should_show(line):
+      click.echo(line)
+  for note in notes:
+    click.secho(note, fg="green")
+  if lm:
+    for line in _lm_summary(lines, warmup_iterations):
+      click.secho(line, fg="green")
+  elif run is not None:
+    outcome = model_caches.Outcome(
+        first=processes["first"],
+        measured=processes["measured"],
+        written=run["written"],
+        rewritten=run["rewritten"],
+        fallback=run["fallback"],
+    )
+    for line in model_caches.report(accelerator, outcome):
+      click.secho(line, fg="green")
 
 
 def _upload(local_path: str, gcs_dir: str, what: str) -> None:
@@ -649,6 +929,8 @@ def _fetch_session_outputs(
     *,
     lm: bool = False,
     warmup_iterations: int = 0,
+    accelerator: str = "cpu",
+    caches: bool = True,
 ) -> list[str]:
   """Downloads each job's output files and prints the benchmark results.
 
@@ -695,6 +977,8 @@ def _fetch_session_outputs(
           passed=passed,
           lm=lm,
           warmup_iterations=warmup_iterations,
+          accelerator=accelerator,
+          caches=caches,
       )
   return problems
 
@@ -722,7 +1006,8 @@ def run_ddp(
   """Runs the model on DDP devices via the Device Run API.
 
   Uploads model to GCS if it's not already there.
-  Submits a Device Run session that runs benchmark_model on each device, or
+  Submits a Device Run session that runs benchmark_model twice on each device
+  (see model_caches; once, as before, with LITERT_DISABLE_MODEL_CACHES=1), or
   LiteRT-LM's benchmark binary for a .litertlm bundle.
   Polls the session operation, then downloads and prints the results.
   Raises click.ClickException (exit code 1) when any step fails or when a
@@ -743,9 +1028,9 @@ def run_ddp(
     warmup_min_secs: Minimum warmup duration in seconds.
     input_layer_value_range: Value range for input layers.
     signature_key: The signature key to benchmark.
-    timeout: Seconds to wait for the session; None means max_secs (the execution
-      timeout for a bundle) times the number of devices plus
-      _POLL_TIMEOUT_SLACK_SECS.
+    timeout: Seconds to wait for the session; None means the job's execution
+      timeout (max_secs without the model caches) times the number of devices
+      plus _POLL_TIMEOUT_SLACK_SECS.
     prefill_tokens: Prefill tokens of a bundle's benchmark.
     decode_tokens: Decode tokens of a bundle's benchmark.
     max_num_tokens: Context length of a bundle's benchmark.
@@ -815,8 +1100,14 @@ def run_ddp(
     model_path = f"{inputs_gcs_dir}/{model_name}"
 
   output_dir = f"gs://{target_bucket}/{_GCS_SESSIONS_PREFIX}"
+  caches = not lm and model_caches.uses_caches(accelerator)
+  if lm:
+    job_secs = _LM_EXECUTION_TIMEOUT_SECS
+  elif caches:
+    job_secs = _tflite_execution_timeout_secs(max_secs)
+  else:
+    job_secs = max_secs
   if timeout is None:
-    job_secs = _LM_EXECUTION_TIMEOUT_SECS if lm else max_secs
     timeout = int(job_secs * len(device_list)) + _POLL_TIMEOUT_SLACK_SECS
 
   click.echo("Fetching GCP access token...")
@@ -864,7 +1155,43 @@ def run_ddp(
         execution_timeout_secs=_LM_EXECUTION_TIMEOUT_SECS,
         runtime="litert-lm",
     )
+  elif caches:
+    # The job's binary is the run script; it starts benchmark_model, pushed
+    # beside the model, twice.
+    benchmark_binary = _benchmark_binary()
+    bench_args = _build_benchmark_args(
+        model_name=model_name,
+        accelerator=accelerator,
+        num_runs=num_runs,
+        warmup_runs=warmup_runs,
+        min_secs=min_secs,
+        max_secs=max_secs,
+        warmup_min_secs=warmup_min_secs,
+        input_layer_value_range=input_layer_value_range,
+        signature_key=signature_key,
+    )
+    script, bench_args = _tflite_job(model_name, accelerator, bench_args)
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      script_path = os.path.join(tmp_dir, _TFLITE_RUN_SCRIPT_NAME)
+      with open(script_path, "w") as f:
+        f.write(script)
+      _upload(script_path, inputs_gcs_dir, "run script")
+    body = _build_session_request(
+        session_name=session_name,
+        model_gcs_path=model_path,
+        model_name=model_name,
+        accelerator=accelerator,
+        device_list=device_list,
+        output_dir=output_dir,
+        benchmark_binary=f"{inputs_gcs_dir}/{_TFLITE_RUN_SCRIPT_NAME}",
+        bench_args=bench_args,
+        extra_pushes=[(benchmark_binary, _TFLITE_BINARY)],
+        result_files=_TFLITE_RESULT_FILES,
+        execution_timeout_secs=job_secs,
+        extra_labels={"model_caches": "on"},
+    )
   else:
+    # As before the model caches: the job runs benchmark_model itself, once.
     benchmark_binary = _benchmark_binary()
     bench_args = _build_benchmark_args(
         model_name=model_name,
@@ -886,6 +1213,7 @@ def run_ddp(
         output_dir=output_dir,
         benchmark_binary=benchmark_binary,
         bench_args=bench_args,
+        extra_labels={"model_caches": "off"},
     )
 
   # Submit the session via http requests to the Device Run API.
@@ -970,7 +1298,12 @@ def run_ddp(
       fg="green" if result == "PASSED" else "red",
   )
   problems = _fetch_session_outputs(
-      session_report, session_id, lm=lm, warmup_iterations=warmup_runs
+      session_report,
+      session_id,
+      lm=lm,
+      warmup_iterations=warmup_runs,
+      accelerator=accelerator,
+      caches=caches,
   )
   if result != "PASSED" and not problems:
     problems.append(f"Session '{session_id}' finished: {result}")
