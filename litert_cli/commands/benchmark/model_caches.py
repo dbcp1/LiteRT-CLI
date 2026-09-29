@@ -24,21 +24,31 @@ can read those caches, and it reports the peak memory too.
 The caches are an addition to the benchmark, not what it depends on. When a
 process that carries the cache flags exits non-zero, or the cache directory
 cannot be made, benchmark_model runs once without the cache flags, as it did
-before the caches, and the CLI fails only if that run fails. `report` says
-which of these happened and, after the two processes, what the first one
-wrote and whether the measured one used it, from the cache files and the lines
-both processes logged.
+before the caches, and the CLI fails only if that run fails. Setting
+LITERT_DISABLE_MODEL_CACHES=1 runs it once from the start. `report` says which
+of these happened and, after the two processes, what the first one wrote and
+whether the measured one used it, from the cache files and the lines both
+processes logged.
 """
 
 from __future__ import annotations
 
 import dataclasses
+import os
 import pathlib
 import re
+
+from litert_cli.core import constants
 
 # The first process only loads and compiles the model.
 WARMUP_ARGS = ("--dry_run=true",)
 PEAK_MEMORY_ARG = "--report_peak_memory_footprint=true"
+# What the report says when LITERT_DISABLE_MODEL_CACHES=1 turned the two
+# processes off.
+DISABLED_LINE = (
+    f"Model caches: off ({constants.ENV_LITERT_DISABLE_MODEL_CACHES}=1):"
+    " benchmark_model ran once without the cache flags"
+)
 # Lines of a failed process shown before the run without the cache flags.
 OUTPUT_TAIL_LINES = 20
 
@@ -56,9 +66,17 @@ _GPU_CACHE_NOT_SAVED = "Failed to save serialized data"
 _XNNPACK_CACHE_LOADED = "XNNPack weight cache loaded from"
 
 
+def disabled() -> bool:
+  """Whether LITERT_DISABLE_MODEL_CACHES=1 turns the two processes off.
+
+  Read when a benchmark starts, not when the module loads.
+  """
+  return os.environ.get(constants.ENV_LITERT_DISABLE_MODEL_CACHES, "0") == "1"
+
+
 def uses_caches(accelerator: str) -> bool:
   """Whether the benchmark runs the two processes (NPU runs once, as before)."""
-  return accelerator in ("cpu", "gpu")
+  return accelerator in ("cpu", "gpu") and not disabled()
 
 
 def cache_args(accelerator: str, cache_dir: str, model_name: str) -> list[str]:

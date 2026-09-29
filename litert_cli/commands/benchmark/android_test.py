@@ -15,6 +15,7 @@
 
 """Tests for the Android benchmark target (no device: adb is faked)."""
 
+import os
 import pathlib
 import shutil
 import subprocess
@@ -121,7 +122,9 @@ class RunAndroidTest(absltest.TestCase):
     self.model.write_bytes(b"\0")
     self.plain = f"{_ROOT}/benchmark_model --graph={_ROOT}/m.tflite"
 
-  def _invoke(self, fake: _FakeAdb, *extra_args: str) -> testing.Result:
+  def _invoke(
+      self, fake: _FakeAdb, *extra_args: str, env=None
+  ) -> testing.Result:
     with (
         mock.patch.object(android.subprocess, "run", side_effect=fake.run),
         mock.patch.object(android.subprocess, "Popen", side_effect=fake.popen),
@@ -153,7 +156,10 @@ class RunAndroidTest(absltest.TestCase):
         ),
         mock.patch.object(constants, "DEFAULT_QUIET", True),
         mock.patch.object(benchmark_cli.utils, "enable_quiet_mode"),
+        mock.patch.dict(os.environ),
     ):
+      os.environ.pop(constants.ENV_LITERT_DISABLE_MODEL_CACHES, None)
+      os.environ.update(env or {})
       return testing.CliRunner().invoke(
           benchmark_cli.benchmark_cmd,
           [str(self.model), "--android", *extra_args],
@@ -354,6 +360,20 @@ class RunAndroidTest(absltest.TestCase):
     self.assertIn("Model caches: on\n", result.output)
     self.assertIn("Could not list the cache files it wrote\n", result.output)
     self.assertNotIn("Caches it wrote", result.output)
+
+  def test_the_environment_variable_runs_one_process_from_the_start(self):
+    fake = _FakeAdb()
+    result = self._invoke(
+        fake, "--cpu", env={constants.ENV_LITERT_DISABLE_MODEL_CACHES: "1"}
+    )
+    self.assertEqual(result.exit_code, 0, result.output)
+    self.assertEqual(fake.runs, [self.plain])
+    self.assertFalse(any("benchmark_cache_" in str(c) for c in fake.commands))
+    self.assertIn(
+        "Model caches: off (LITERT_DISABLE_MODEL_CACHES=1): benchmark_model"
+        " ran once without the cache flags\n",
+        result.output,
+    )
 
   def test_npu_runs_once_without_the_cache_flags(self):
     fake = _FakeAdb()

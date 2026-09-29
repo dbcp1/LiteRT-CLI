@@ -171,6 +171,8 @@ def run_android(
   if outcome is not None:
     for line in model_caches.report(accelerator, outcome):
       click.secho(line, fg="green")
+  elif accelerator != "npu":
+    click.secho(model_caches.DISABLED_LINE, fg="green")
 
 
 def _run_with_caches(

@@ -87,14 +87,17 @@ class RunDesktopTest(absltest.TestCase):
     self.model.write_bytes(b"\0")
     self.plain = [f"--graph={self.model.resolve()}"]
 
-  def _invoke(self, *extra_args: str) -> testing.Result:
+  def _invoke(self, *extra_args: str, env=None) -> testing.Result:
     with (
         mock.patch.object(
             desktop, "_ensure_desktop_binary", return_value=self.fake
         ),
         mock.patch.object(constants, "DEFAULT_QUIET", True),
         mock.patch.object(benchmark_cli.utils, "enable_quiet_mode"),
+        mock.patch.dict(os.environ, env or {}),
     ):
+      os.environ.pop(constants.ENV_LITERT_DISABLE_MODEL_CACHES, None)
+      os.environ.update(env or {})
       return testing.CliRunner().invoke(
           benchmark_cli.benchmark_cmd,
           [str(self.model), "--desktop", *extra_args],
@@ -286,6 +289,27 @@ class RunDesktopTest(absltest.TestCase):
     self.assertIn("Full output for debugging:", result.output)
     self.assertIn("Error: Benchmark failed on desktop.", result.output)
     self.assertNotIn("Model caches:", result.output)
+
+  def test_the_environment_variable_runs_one_process_from_the_start(self):
+    result = self._invoke(
+        "--cpu", env={constants.ENV_LITERT_DISABLE_MODEL_CACHES: "1"}
+    )
+    self.assertEqual(result.exit_code, 0, result.output)
+    self.assertEqual(self._calls(), [self.plain])
+    self.assertIn(
+        "Model caches: off (LITERT_DISABLE_MODEL_CACHES=1): benchmark_model"
+        " ran once without the cache flags\n",
+        result.output,
+    )
+    self.assertNotIn("First process", result.output)
+    # Only the value 1 turns the caches off.
+    (self.dir / "calls.txt").unlink()
+    result = self._invoke(
+        "--cpu", env={constants.ENV_LITERT_DISABLE_MODEL_CACHES: "0"}
+    )
+    self.assertEqual(result.exit_code, 0, result.output)
+    self.assertLen(self._calls(), 2)
+    self.assertIn("Model caches: on\n", result.output)
 
   def test_npu_runs_once_without_the_cache_flags(self):
     result = self._invoke("--npu")

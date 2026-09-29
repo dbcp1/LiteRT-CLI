@@ -831,6 +831,7 @@ def _print_logcat_results(
     lm: bool = False,
     warmup_iterations: int = 0,
     accelerator: str = "cpu",
+    caches: bool = True,
 ) -> None:
   """Prints the benchmark lines of a logcat, or its tail when the job failed.
 
@@ -840,7 +841,8 @@ def _print_logcat_results(
   script's record, they are the measured process's, or the lines of the
   process that ran without the cache flags after a failure, followed by the
   model caches report; when the record's pids match no logcat line, every
-  process's lines are printed and a line says so.
+  process's lines are printed and a line says so. `caches` is whether the
+  job ran the script at all.
   """
   lines = logcat_path.read_text(errors="replace").splitlines()
   run_path = logcat_path.parent / _TFLITE_RUN_FILE
@@ -883,6 +885,8 @@ def _print_logcat_results(
       ):
         if processes[label]:
           lines += [heading] + processes[label]
+  elif not lm and not caches:
+    notes.append(model_caches.DISABLED_LINE)
   elif not lm:
     notes.append(_NO_RECORD_LINE)
   for line in lines:
@@ -926,6 +930,7 @@ def _fetch_session_outputs(
     lm: bool = False,
     warmup_iterations: int = 0,
     accelerator: str = "cpu",
+    caches: bool = True,
 ) -> list[str]:
   """Downloads each job's output files and prints the benchmark results.
 
@@ -973,6 +978,7 @@ def _fetch_session_outputs(
           lm=lm,
           warmup_iterations=warmup_iterations,
           accelerator=accelerator,
+          caches=caches,
       )
   return problems
 
@@ -1001,7 +1007,8 @@ def run_ddp(
 
   Uploads model to GCS if it's not already there.
   Submits a Device Run session that runs benchmark_model twice on each device
-  (see model_caches), or LiteRT-LM's benchmark binary for a .litertlm bundle.
+  (see model_caches; once, as before, with LITERT_DISABLE_MODEL_CACHES=1), or
+  LiteRT-LM's benchmark binary for a .litertlm bundle.
   Polls the session operation, then downloads and prints the results.
   Raises click.ClickException (exit code 1) when any step fails or when a
   job does not pass.
@@ -1022,7 +1029,8 @@ def run_ddp(
     input_layer_value_range: Value range for input layers.
     signature_key: The signature key to benchmark.
     timeout: Seconds to wait for the session; None means the job's execution
-      timeout times the number of devices plus _POLL_TIMEOUT_SLACK_SECS.
+      timeout (max_secs without the model caches) times the number of devices
+      plus _POLL_TIMEOUT_SLACK_SECS.
     prefill_tokens: Prefill tokens of a bundle's benchmark.
     decode_tokens: Decode tokens of a bundle's benchmark.
     max_num_tokens: Context length of a bundle's benchmark.
@@ -1092,11 +1100,13 @@ def run_ddp(
     model_path = f"{inputs_gcs_dir}/{model_name}"
 
   output_dir = f"gs://{target_bucket}/{_GCS_SESSIONS_PREFIX}"
-  job_secs = (
-      _LM_EXECUTION_TIMEOUT_SECS
-      if lm
-      else _tflite_execution_timeout_secs(max_secs)
-  )
+  caches = not lm and model_caches.uses_caches(accelerator)
+  if lm:
+    job_secs = _LM_EXECUTION_TIMEOUT_SECS
+  elif caches:
+    job_secs = _tflite_execution_timeout_secs(max_secs)
+  else:
+    job_secs = max_secs
   if timeout is None:
     timeout = int(job_secs * len(device_list)) + _POLL_TIMEOUT_SLACK_SECS
 
@@ -1145,7 +1155,7 @@ def run_ddp(
         execution_timeout_secs=_LM_EXECUTION_TIMEOUT_SECS,
         runtime="litert-lm",
     )
-  else:
+  elif caches:
     # The job's binary is the run script; it starts benchmark_model, pushed
     # beside the model, twice.
     benchmark_binary = _benchmark_binary()
@@ -1179,6 +1189,31 @@ def run_ddp(
         result_files=_TFLITE_RESULT_FILES,
         execution_timeout_secs=job_secs,
         extra_labels={"model_caches": "on"},
+    )
+  else:
+    # As before the model caches: the job runs benchmark_model itself, once.
+    benchmark_binary = _benchmark_binary()
+    bench_args = _build_benchmark_args(
+        model_name=model_name,
+        accelerator=accelerator,
+        num_runs=num_runs,
+        warmup_runs=warmup_runs,
+        min_secs=min_secs,
+        max_secs=max_secs,
+        warmup_min_secs=warmup_min_secs,
+        input_layer_value_range=input_layer_value_range,
+        signature_key=signature_key,
+    )
+    body = _build_session_request(
+        session_name=session_name,
+        model_gcs_path=model_path,
+        model_name=model_name,
+        accelerator=accelerator,
+        device_list=device_list,
+        output_dir=output_dir,
+        benchmark_binary=benchmark_binary,
+        bench_args=bench_args,
+        extra_labels={"model_caches": "off"},
     )
 
   # Submit the session via http requests to the Device Run API.
@@ -1268,6 +1303,7 @@ def run_ddp(
       lm=lm,
       warmup_iterations=warmup_runs,
       accelerator=accelerator,
+      caches=caches,
   )
   if result != "PASSED" and not problems:
     problems.append(f"Session '{session_id}' finished: {result}")

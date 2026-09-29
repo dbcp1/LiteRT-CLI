@@ -456,8 +456,11 @@ class RunDdpTest(absltest.TestCase):
     self.model = pathlib.Path(self.tmp_dir) / "m.tflite"
     self.model.write_bytes(b"\0")
 
-  def _invoke(self, fake: _FakeCloud, *extra_args: str, model=None):
-    """Runs the benchmark command through click and returns the result."""
+  def _invoke(self, fake: _FakeCloud, *extra_args: str, model=None, env=None):
+    """Runs the benchmark command through click and returns the result.
+
+    The model caches are on unless `env` sets the variable.
+    """
     args = [
         str(model or self.model),
         "--ddp",
@@ -467,7 +470,9 @@ class RunDdpTest(absltest.TestCase):
         "p",
         *extra_args,
     ]
-    with _patched(fake, self.tmp_dir):
+    with _patched(fake, self.tmp_dir), mock.patch.dict(os.environ):
+      os.environ.pop(constants.ENV_LITERT_DISABLE_MODEL_CACHES, None)
+      os.environ.update(env or {})
       return testing.CliRunner().invoke(benchmark_cli.benchmark_cmd, args)
 
   def _push_path(self, fake: _FakeCloud, job_index: int = 0) -> str:
@@ -679,8 +684,10 @@ class RunDdpTest(absltest.TestCase):
     fake = _FakeCloud([_done_response()])
     with (
         _patched(fake, self.tmp_dir),
+        mock.patch.dict(os.environ),
         contextlib.redirect_stdout(io.StringIO()),
     ):
+      os.environ.pop(constants.ENV_LITERT_DISABLE_MODEL_CACHES, None)
       ddp.run_ddp(
           "gs://b/dir/m.tflite",
           "gpu",
@@ -722,6 +729,45 @@ class RunDdpTest(absltest.TestCase):
             "jobConfigs"
         ][0]["action"]["androidNativeBinary"]["executionTimeout"],
         "300s",
+    )
+
+  def test_the_environment_variable_runs_benchmark_model_itself_as_before(
+      self,
+  ):
+    fake = _FakeCloud([_done_response()])
+    result = self._invoke(
+        fake, "--gpu", env={constants.ENV_LITERT_DISABLE_MODEL_CACHES: "1"}
+    )
+    self.assertEqual(result.exit_code, 0, result.output)
+    uploads = [
+        os.path.basename(c[3])
+        for c in fake.commands
+        if c[:3] == ["gcloud", "storage", "cp"] and not c[3].startswith("gs://")
+    ]
+    self.assertEqual(uploads, ["m.tflite"])
+    body = json.loads(fake.requests[0].data.decode())
+    job = body["sessionConfig"]["jobConfigs"][0]
+    binary = job["action"]["androidNativeBinary"]
+    self.assertEqual(
+        binary["androidNativeBinary"]["gcsInputFile"]["path"], _BINARY
+    )
+    self.assertEqual(
+        binary["args"][:2], [f"--graph={_ROOT}/m.tflite", "--use_gpu=true"]
+    )
+    self.assertFalse(any("cache" in arg for arg in binary["args"]))
+    self.assertNotIn("executionTimeout", binary)
+    self.assertEqual(job["labels"]["model_caches"], "off")
+    actions = job["allocationConfig"]["deviceConfigs"][0]["actions"]
+    self.assertLen(actions[0]["androidPushFiles"]["fileConfigs"], 1)
+    self.assertEqual(
+        actions[1]["androidPullFiles"]["paths"],
+        [f"{_ROOT}/results.pb", f"{_ROOT}/runtime_info.pb"],
+    )
+    self.assertIn("timeout: 750 s", result.output)
+    self.assertIn(
+        "Model caches: off (LITERT_DISABLE_MODEL_CACHES=1): benchmark_model"
+        " ran once without the cache flags",
+        result.output,
     )
 
   def test_missing_bucket_is_created(self):
@@ -1691,6 +1737,23 @@ class TflitePrintTest(absltest.TestCase):
         "Model caches: no record (the job pulled no benchmark_run.txt); the"
         " benchmark lines above are every process's\n",
         out,
+    )
+
+  def test_with_the_caches_off_the_environment_variable_is_named(self):
+    (self.dir / "logcat.txt").write_text(_tflite_process("4000", "590.73"))
+    out = io.StringIO()
+    with (
+        mock.patch.object(constants, "DEFAULT_QUIET", True),
+        contextlib.redirect_stdout(out),
+    ):
+      ddp._print_logcat_results(
+          self.dir / "logcat.txt", True, accelerator="cpu", caches=False
+      )
+    self.assertIn("Model initialization: 590.73 ms", out.getvalue())
+    self.assertIn(
+        "Model caches: off (LITERT_DISABLE_MODEL_CACHES=1): benchmark_model"
+        " ran once without the cache flags\n",
+        out.getvalue(),
     )
 
   def test_a_failed_job_prints_the_record_after_the_logcat_tail(self):
