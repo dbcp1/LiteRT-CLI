@@ -302,8 +302,10 @@ litert benchmark model.tflite --ddp --devices "caiman-35, pa3q-35" --gpu --gcp-p
 
 # A .litertlm bundle on DDP devices runs LiteRT-LM's prebuilt benchmark binary (gs://litert/binaries/latest/android_arm64/litert_lm/;
 # DDP_LITERT_LM_VERSION picks another version there, DDP_LITERT_LM_DIR a gs:// directory laid out the same way): prefill and decode tokens/s at --prefill-tokens / --decode-tokens
-# (default 1024 / 256), --num-iterations times (default 5) in one process; the printed medians leave out the first
-# --warmup-runs iterations (default 1). The metrics proto and provenance land under ~/.cache/litert-cli/ddp/<session>/<job>/.
+# (default 1024 / 256), --num-iterations times (default 5). The binary runs twice: a warm-up process (one iteration, a cold
+# Init) writes the caches beside the bundle, then the measured process loads them; the printed medians leave out its first
+# --warmup-runs iterations (default 1) and the summary shows both Init times and the peak memory. The metrics proto and
+# provenance land under ~/.cache/litert-cli/ddp/<session>/<job>/.
 litert benchmark model.litertlm --ddp --device caiman-35 --gpu --gcp-project "your-gcp-project-id"
 ```
 

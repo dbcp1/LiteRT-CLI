@@ -37,7 +37,9 @@ class LmBenchmarkLogFilter:
   """Filters the logcat of LiteRT-LM's benchmark binary (a .litertlm bundle)."""
 
   # The binary's engine setup lines, the accelerator and sampler
-  # registrations, and the BenchmarkInfo blocks it logs once per iteration.
+  # registrations, the BenchmarkInfo blocks and peak memory lines it logs once
+  # per iteration, and the lines that say a cache was loaded (XNNPACK's weight
+  # cache on CPU, the ML Drift program cache on GPU).
   _MARKERS = (
       "litert_lm_lib.cc",
       "gpu_registry.cc",
@@ -53,6 +55,8 @@ class LmBenchmarkLogFilter:
       "Decode Speed",
       "Peak system ram",
       "Peak private footprint",
+      "weight cache loaded",
+      "InferenceContext from serialized data",
   )
 
   def __init__(self, default_quiet: bool):
