@@ -35,6 +35,13 @@ echo "Running LiteRT CLI model demo(s) with shared virtual environment..."
 if [ "$TARGET_MODELS" == "--all" ] || [ -z "$1" ]; then
   echo "Executing all model test scripts under models/ directory..."
   for model_script in "$SCRIPT_DIR/models/"*.sh; do
+    
+    # Skip the compile step
+    if [[ "$model_script" == *"compile"* ]]; then
+      echo -e "\n[Note: $(basename "$model_script") is excluded from execution.]\n"
+      continue
+    fi
+
     echo -e "\n=================================================================="
     echo ">>> Executing $model_script..."
     echo -e "==================================================================\n"
@@ -46,6 +53,13 @@ else
   IFS=',' read -ra MODEL_ARRAY <<< "$TARGET_MODELS"
 
   for model in "${MODEL_ARRAY[@]}"; do
+    
+    # Skip the compile step
+    if [ "$model" == "compile" ]; then
+      echo -e "\n[Note: compile step is excluded.]"
+      continue
+    fi
+
     target_script="$SCRIPT_DIR/models/${model}.sh"
     if [ ! -f "$target_script" ]; then
       echo -e "\nError: Model test script not found: $target_script"
